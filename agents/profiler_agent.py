@@ -340,35 +340,180 @@ class ProfilerAgent(BaseAgent):
     # ------------------------------------------------------------------
     def run_envelope(self) -> TrainingEnvelope:
         with self._lifecycle("detect hardware envelope"):
-            self.emit_event(
-                EventType.TOOL_CALL,
-                message="pynvml.nvmlDeviceGetCount() [stub: simulating L40S]",
+            gpu_available = False
+            gpu_name = None
+            gpu_memory_gb = 0.0
+            mixed_precision = False
+            notes_parts = []
+            
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                device_count = pynvml.nvmlDeviceGetCount()
+                
+                if device_count > 0:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    
+                    raw_name = pynvml.nvmlDeviceGetName(handle)
+                    gpu_name = (
+                        raw_name.decode() if isinstance(raw_name, bytes) else raw_name)
+                    
+                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    gpu_memory_gb = round(mem_info.total / 1024**3, 1)
+                    
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    gpu_util_pct = util.gpu
+                    mem_util_pct = util.memory
+                    
+                    temp_c = pynvml.nvmlDeviceGetTemperature(
+                        handle, pynvml.NVML_TEMPERATURE_GPU
+                        )
+                    
+                    gpu_available = True
+                    mixed_precision = gpu_memory_gb >= 16.0  # safe threshold
+                    
+                    self.emit_event(
+                        EventType.TOOL_CALL,
+                        message=(
+                            f"pynvml: {gpu_name} | "
+                            f"{gpu_memory_gb:.1f} GB VRAM | "
+                            f"GPU util {gpu_util_pct}% | "
+                            f"Mem util {mem_util_pct}% | "
+                            f"Temp {temp_c}°C"
+                        ),
+                    )
+                    notes_parts.append(
+                        f"{gpu_name} detected ({gpu_memory_gb:.1f} GB VRAM, "
+                        f"{gpu_util_pct}% util, {temp_c}°C)."
+                    )
+                    
+                else:
+                    self.emit_event(EventType.WARNING, message="pynvml: no GPUs found")
+                    notes_parts.append("No GPU detected — CPU-only mode.")
+                
+                pynvml.nvmlShutdown()
+                    
+            except Exception as exc:
+                self.emit_event(
+                    EventType.WARNING,
+                    message=f"pynvml unavailable: {exc} — falling back to CPU-only",
+                )
+                notes_parts.append(f"GPU detection failed ({exc}); CPU-only mode.")
+                    
+            try:
+                        
+                import psutil
+                cpu_count = psutil.cpu_count(logical=False) or psutil.cpu_count()
+                cpu_util_pct = psutil.cpu_percent(interval=0.5)
+                        
+                ram = psutil.virtual_memory()
+                system_memory_gb = round(ram.total / 1024**3, 1)
+                ram_used_pct = ram.percent
+                        
+                self.emit_event(
+                    EventType.TOOL_CALL,
+                    message=(
+                        f"psutil: {cpu_count} cores | "
+                        f"CPU util {cpu_util_pct}% | "
+                        f"{system_memory_gb:.1f} GB RAM | "
+                        f"RAM used {ram_used_pct}%"
+                    ),
+                )
+                
+                notes_parts.append(
+                    f"{cpu_count} CPU cores, {system_memory_gb:.1f} GB RAM "
+                    f"({ram_used_pct}% used)."
+                )
+                        
+            except Exception as exc:
+                self.emit_event(
+                    EventType.WARNING,
+                    message=f"psutil unavailable: {exc} — using fallback defaults",
+                )
+                cpu_count = 4
+                system_memory_gb = 16.0
+                notes_parts.append(f"CPU/RAM detection failed ({exc}); using defaults.")
+
+        # ── Derive trial budget from available VRAM ─────────────────
+            if gpu_memory_gb >= 40:
+                max_trials = 20
+                max_train_minutes = 5.0
+                batch_size_range = (32, 256)
+            elif gpu_memory_gb >= 16:
+                max_trials = 12
+                max_train_minutes = 8.0
+                batch_size_range = (16, 128)
+            elif gpu_memory_gb > 0:
+                max_trials = 6
+                max_train_minutes = 15.0
+                batch_size_range = (8, 64)
+            else:
+            # CPU-only
+                max_trials = 3
+                max_train_minutes = 20.0
+                batch_size_range = (8, 32)
+
+            notes_parts.append(
+                f"Trial budget: {max_trials} trials, "
+                f"{max_train_minutes:.0f} min cap, "
+                f"batch {batch_size_range[0]}–{batch_size_range[1]}."
             )
-            time.sleep(STUB_AGENT_SLEEP)
+
             envelope = TrainingEnvelope(
-                gpu_available=True,
-                gpu_name="NVIDIA L40S",
-                gpu_memory_gb=48.0,
-                cpu_count=16,
-                system_memory_gb=128.0,
-                max_train_minutes=5.0,
-                max_trials=20,
-                batch_size_range=(32, 256),
+                gpu_available=gpu_available,
+                gpu_name=gpu_name,
+                gpu_memory_gb=gpu_memory_gb,
+                cpu_count=cpu_count,
+                system_memory_gb=system_memory_gb,
+                max_train_minutes=max_train_minutes,
+                max_trials=max_trials,
+                batch_size_range=batch_size_range,
                 allowed_libraries=["xgboost", "sklearn", "pytorch", "torchvision"],
-                mixed_precision=False,
-                notes=(
-                    "L40S has headroom for tabular and small-image workloads. "
-                    "Capping trials at 20 for ≤5-min iteration time."
-                ),
+                mixed_precision=mixed_precision,
+                notes=" ".join(notes_parts),
             )
+
             self.emit_event(
                 EventType.INFO,
                 message=(
-                    f"envelope: gpu={envelope.gpu_name}, "
+                    f"envelope: gpu={envelope.gpu_name or 'none'} | "
+                    f"{envelope.gpu_memory_gb:.1f} GB VRAM | "
+                    f"{envelope.cpu_count} cores | "
+                    f"{envelope.system_memory_gb:.1f} GB RAM | "
                     f"max_trials={envelope.max_trials}"
                 ),
             )
         return envelope
+        # with self._lifecycle("detect hardware envelope"):
+        #     self.emit_event(
+        #         EventType.TOOL_CALL,
+        #         message="pynvml.nvmlDeviceGetCount() [stub: simulating L40S]",
+        #     )
+        #     time.sleep(STUB_AGENT_SLEEP)
+        #     envelope = TrainingEnvelope(
+        #         gpu_available=True,
+        #         gpu_name="NVIDIA L40S",
+        #         gpu_memory_gb=48.0,
+        #         cpu_count=16,
+        #         system_memory_gb=128.0,
+        #         max_train_minutes=5.0,
+        #         max_trials=20,
+        #         batch_size_range=(32, 256),
+        #         allowed_libraries=["xgboost", "sklearn", "pytorch", "torchvision"],
+        #         mixed_precision=False,
+        #         notes=(
+        #             "L40S has headroom for tabular and small-image workloads. "
+        #             "Capping trials at 20 for ≤5-min iteration time."
+        #         ),
+        #     )
+        #     self.emit_event(
+        #         EventType.INFO,
+        #         message=(
+        #             f"envelope: gpu={envelope.gpu_name}, "
+        #             f"max_trials={envelope.max_trials}"
+        #         ),
+        #     )
+        # return envelope
 
 
 # ---------------------------------------------------------------------------
