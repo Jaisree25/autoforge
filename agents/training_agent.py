@@ -49,10 +49,14 @@ from agents.base_agent import BaseAgent
 from tools import training_pipeline as tp
 
 
-# Source for the helper module the Trainer drops into the training dir
-# as `autoforge_helpers.py`.
+# Source for the helper modules the Trainer drops into the training dir.
+# autoforge_helpers.py = data loading + joblib output
+# autoforge_optuna.py  = sklearn-aware HP search via Optuna
 _HELPERS_SRC = (
     Path(__file__).resolve().parent.parent / "tools" / "train_helpers.py"
+)
+_OPTUNA_SRC = (
+    Path(__file__).resolve().parent.parent / "tools" / "optuna_search.py"
 )
 
 
@@ -122,21 +126,18 @@ class TrainingAgent(BaseAgent):
             self._check_prepared_data(dataset_profile, preparation_report)
             self._announce_helper_actions(dataset_profile, preparation_report)
 
-            # --- Stage 1: Oracle ---
-            self.emit_event(
-                EventType.TOOL_CALL,
-                message="oracle = sklearn.LogisticRegression on the split",
-            )
-            oracle = tp.run_oracle(dataset_profile, preparation_report, run_dir)
-            self.emit_event(
-                EventType.INFO,
-                message=(
-                    f"oracle baseline: test_accuracy={oracle['test_accuracy']:.3f} "
-                    f"in {oracle['wall_clock_s']:.1f}s "
-                    f"(n_train={oracle['n_train']}, n_test={oracle['n_test']})"
-                ),
-            )
-
+            # Oracle baseline removed — the agent's design.md is now judged
+            # purely against the StrategySpec.success_threshold. The stub
+            # below keeps downstream signatures unchanged for now (callers
+            # treat test_accuracy=0.0 as "no oracle context").
+            oracle: dict[str, Any] = {
+                "model": "(no oracle)",
+                "test_accuracy": 0.0,
+                "wall_clock_s": 0.0,
+                "n_train": 0,
+                "n_test": 0,
+                "n_features": 0,
+            }
             prep_config = self._load_prep_config(preparation_report)
             if prep_config:
                 self.emit_event(
@@ -200,6 +201,7 @@ class TrainingAgent(BaseAgent):
             train_py = self._render_train_template(dataset_profile)
             (code_dir / "train.py").write_text(train_py, encoding="utf-8")
             shutil.copy2(_HELPERS_SRC, code_dir / "autoforge_helpers.py")
+            shutil.copy2(_OPTUNA_SRC, code_dir / "autoforge_optuna.py")
             self.emit_event(
                 EventType.INFO,
                 message="wrote templated train.py + autoforge_helpers.py",
@@ -389,9 +391,7 @@ class TrainingAgent(BaseAgent):
             all_trials=trials,
             training_process=training_process,
             notes=(
-                f"linear-pipeline: oracle={oracle['test_accuracy']:.3f}, "
-                f"trained={val_acc:.3f} "
-                f"(+{(val_acc - oracle['test_accuracy']):+.3f} vs oracle). "
+                f"linear-pipeline: trained={val_acc:.3f}. "
                 f"Smoke {passed_checks}/{total_checks} passed."
             ),
         )
@@ -421,8 +421,7 @@ class TrainingAgent(BaseAgent):
             agent=AgentName.TRAINING,
             title="Approve design.md (Trainer)",
             description=(
-                f"Trainer wrote a design before generating any code. Oracle "
-                f"baseline = {oracle['test_accuracy']:.3f}; must beat by ≥0.05. "
+                f"Trainer wrote a design before generating any code. "
                 f"Target {strategy_spec.success_metric} ≥ "
                 f"{strategy_spec.success_threshold:.2f}. Approve to generate "
                 f"model.py and run training; edit to change hyperparameters."
@@ -679,11 +678,11 @@ class TrainingAgent(BaseAgent):
 # metrics boilerplate.
 # ===========================================================================
 _TRAIN_PY_TABULAR = '''\
-"""AutoForge-templated train.py for tabular classification.
+"""AutoForge-templated train.py for tabular tasks.
 
 Loads `<data-dir>/{train,test}.csv` via autoforge_helpers, applies
-prep_config feature_scaling if present, fits build_model() from model.py,
-saves best.pkl + metrics.json into --output-dir.
+prep_config feature_scaling if present, runs an Optuna HP search around
+build_model() from model.py, saves the best model + metrics.json.
 """
 from __future__ import annotations
 
@@ -693,10 +692,12 @@ import time
 from pathlib import Path
 
 from autoforge_helpers import load_csv_split, save_outputs
+from autoforge_optuna import run_optuna_search
 from model import build_model
 
 
 TARGET_COL = "__TARGET__"
+N_OPTUNA_TRIALS = 10
 
 _SCALER_BY_METHOD = {
     "standard": "StandardScaler",
@@ -746,18 +747,33 @@ def main() -> None:
             X_train = scaler.fit_transform(X_train)
             X_test = scaler.transform(X_test)
 
+    # Identify the sklearn class so Optuna can pick the right search space.
+    # The Trainer's `build_model()` is generated with default kwargs; calling
+    # it once with no overrides yields a base instance whose class we read.
+    sample = build_model()
+    sklearn_class = type(sample).__name__
+
     t0 = time.time()
-    model = build_model()
-    model.fit(X_train, y_train)
+    model, best_params, trials = run_optuna_search(
+        build_model_fn=build_model,
+        sklearn_class=sklearn_class,
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_test,
+        y_val=y_test,
+        n_trials=N_OPTUNA_TRIALS,
+    )
     train_seconds = time.time() - t0
 
-    # `.score()` returns accuracy for classifiers, R² for regressors — so
-    # this works for both task types without branching on metric name.
+    # `.score()` returns accuracy for classifiers, R² for regressors —
+    # works for both task types without branching on metric name.
     val_accuracy = float(model.score(X_test, y_test))
     headline = save_outputs(
         model, output_dir, val_accuracy, train_seconds,
         n_train=len(X_train), n_test=len(X_test),
     )
+    headline["best_optuna_params"] = best_params
+    headline["n_optuna_trials"] = len(trials)
     print(json.dumps(headline))
 
 

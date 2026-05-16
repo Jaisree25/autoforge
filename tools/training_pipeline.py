@@ -121,9 +121,6 @@ def _build_design_user_prompt(
         prep.prepared_dataset_path if (prep and prep.prepared_dataset_path)
         else profile.dataset_path
     )
-    effective_target = max(
-        spec.success_threshold, oracle["test_accuracy"] + 0.05,
-    )
     lines = [
         "## Inputs",
         f"- Modality: tabular CSV (sklearn-only)",
@@ -133,10 +130,8 @@ def _build_design_user_prompt(
         f"- Samples: {profile.n_rows:,} × {profile.n_cols} columns",
         f"- Wall-clock cap: {envelope.max_train_minutes * 60:.0f}s",
         "",
-        "## Targets",
-        f"- Hard: `{spec.success_metric}` ≥ {spec.success_threshold:.3f}",
-        f"- Oracle baseline (sklearn LogReg): test_accuracy = {oracle['test_accuracy']:.3f}",
-        f"- Effective target (max of hard + oracle+0.05): ≥ {effective_target:.3f}",
+        "## Target",
+        f"- `{spec.success_metric}` ≥ {spec.success_threshold:.3f}",
         "",
         "## Researcher's committed architecture (already picked at HITL)",
     ]
@@ -204,6 +199,10 @@ def generate_design_md(
     system = (
         "You are the Trainer. Write design.md for an sklearn model on a "
         "tabular CSV dataset. Output PLAIN MARKDOWN PROSE — not JSON, not code.\n\n"
+        "Note: AutoForge will run an Optuna HP search (~10 trials) around your "
+        "chosen architecture, so your hyperparameter picks are sensible "
+        "*starting points*, not final values. Concentrate on picking the "
+        "RIGHT sklearn class.\n\n"
         "Required sections (level-2 headers, in order, using these EXACT lines):\n"
         "  ## Architecture commitment\n"
         "  ## Hyperparameters (final)\n"
@@ -367,6 +366,40 @@ _FALLBACK_CLASS_FOR_NON_SKLEARN: dict[str, str] = {
 }
 
 
+# Modules to scan when resolving an LLM-picked class name dynamically.
+# Anything reachable via these modules counts as sklearn and is allowed.
+_SKLEARN_MODULES_FOR_LOOKUP = (
+    "sklearn.linear_model",
+    "sklearn.ensemble",
+    "sklearn.neural_network",
+    "sklearn.svm",
+    "sklearn.neighbors",
+    "sklearn.tree",
+    "sklearn.naive_bayes",
+    "sklearn.discriminant_analysis",
+    "sklearn.gaussian_process",
+)
+
+
+def _resolve_sklearn_class(class_name: str) -> tuple[str, str] | None:
+    """Find which sklearn submodule exports `class_name`, if any.
+
+    Returns (module_path, class_name) on hit, None on miss.
+    """
+    import importlib
+    for mod_path in _SKLEARN_MODULES_FOR_LOOKUP:
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            continue
+        if hasattr(mod, class_name):
+            cls = getattr(mod, class_name)
+            # Sanity: must be a class
+            if isinstance(cls, type):
+                return mod_path, class_name
+    return None
+
+
 def _synthesize_model_py(choice: _ModelChoice) -> str:
     """Generate model.py source from the LLM's structured choice.
 
@@ -375,21 +408,32 @@ def _synthesize_model_py(choice: _ModelChoice) -> str:
     of the LLM's prior about what "model.py" should look like.
 
     Defense in depth: non-sklearn class names (XGBoost / LightGBM / CatBoost)
-    are coerced to sklearn's `GradientBoostingClassifier`. Hyperparameters
-    are filtered to ones the target class actually accepts.
+    are coerced to a sklearn equivalent. Class lookup is dynamic — any
+    class reachable via the standard sklearn modules works, not just a
+    hardcoded allowlist. Hyperparameters are filtered to ones the target
+    class actually accepts.
     """
     import importlib
     import inspect
 
     cls = choice.sklearn_class
-    if cls not in _SKLEARN_CLASS_MAP and cls in _FALLBACK_CLASS_FOR_NON_SKLEARN:
+    # Try dynamic sklearn lookup first.
+    resolved = _resolve_sklearn_class(cls)
+    if resolved is None and cls in _FALLBACK_CLASS_FOR_NON_SKLEARN:
         cls = _FALLBACK_CLASS_FOR_NON_SKLEARN[cls]
-    module = _SKLEARN_CLASS_MAP.get(cls)
-    if module is None:
+        resolved = _resolve_sklearn_class(cls)
+    if resolved is None:
+        # Last-resort hardcoded map (legacy paths).
+        legacy_module = _SKLEARN_CLASS_MAP.get(cls)
+        if legacy_module is not None:
+            resolved = (legacy_module, cls)
+    if resolved is None:
         raise ValueError(
             f"LLM picked unsupported class `{choice.sklearn_class}`. "
-            f"Allowed sklearn classes: {sorted(_SKLEARN_CLASS_MAP.keys())!r}"
+            f"Tried dynamic lookup across "
+            f"{sorted(_SKLEARN_MODULES_FOR_LOOKUP)!r} — not found."
         )
+    module, cls = resolved
 
     # Filter HPs to ones the actual class accepts. Drops xgboost-only
     # parameters like `gamma` that would crash sklearn.
@@ -413,12 +457,14 @@ def _synthesize_model_py(choice: _ModelChoice) -> str:
         f"from {module} import {cls}",
         "",
         "",
-        "def build_model():",
-        f"    return {cls}(",
+        "def build_model(**overrides):",
+        f"    params = {{",
     ]
     for k, v in hp.items():
-        lines.append(f"        {k}={_hp_value_to_literal(v)},")
-    lines.append("    )")
+        lines.append(f"        {k!r}: {_hp_value_to_literal(v)},")
+    lines.append("    }")
+    lines.append("    params.update(overrides)")
+    lines.append(f"    return {cls}(**params)")
     lines.append("")
     if dropped or cls != choice.sklearn_class:
         notes = []
@@ -630,9 +676,11 @@ def run_smoke_harness(code_dir: Path) -> dict[str, Any]:
     if design_path.exists():
         design_text = design_path.read_text(encoding="utf-8").strip()
         starts_like_json = design_text.startswith("{") or design_text.startswith("[")
+        # Accept ## (level-2) or ### (level-3) headers — the LLM sometimes
+        # uses the deeper level when retrying with feedback.
         h2_headers = [
             ln for ln in design_text.splitlines()
-            if ln.lstrip().startswith("## ")
+            if ln.lstrip().startswith("## ") or ln.lstrip().startswith("### ")
         ]
         if starts_like_json:
             add(

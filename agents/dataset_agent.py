@@ -30,7 +30,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from config import ARTIFACTS_DIR, COORDINATOR_MODEL
+from config import ARTIFACTS_DIR, WORKER_MODEL
 from contracts.messages import EventType
 from contracts.schemas import (
     AgentName,
@@ -126,7 +126,11 @@ class DatasetAgent(BaseAgent):
         "  `train_test_split_csv` → (optional `set_feature_scaling`).\n"
         "- **ALWAYS include `train_test_split_csv`** — the Evaluator needs "
         "held-out data.\n"
-        "- Emit EACH op AT MOST ONCE. Do not repeat ops.\n\n"
+        "- Emit EACH op AT MOST ONCE. Do not repeat ops.\n"
+        "- **If the dataset is already clean (no NaN, all numeric, no IDs), "
+        "just emit `train_test_split_csv` (and optionally "
+        "`set_feature_scaling`). Do NOT pad with no-op ops.**\n"
+        "- Output 1-5 operations TOTAL. Anything beyond 5 is over-engineering.\n\n"
         "## Worked example output (Titanic-style binary classification)\n"
         "Note how `drop_columns` removes PassengerId (ID), Name (high-card "
         "string), Ticket (high-card), and Cabin (>70% NaN) BEFORE any other op.\n"
@@ -169,7 +173,11 @@ class DatasetAgent(BaseAgent):
         # 49B for prep planning — judgment-heavy; the 9B sometimes picks
         # operations outside the supported list (the enum stops that, but the
         # 49B also writes better rationales).
-        self.llm = NemotronClient(model=COORDINATOR_MODEL)
+        # 9B nano for the prep plan — enum-locked schema means the model
+        # can't drift to unsupported op names, and the 9B is ~3-5× faster
+        # than 49B for this kind of short structured output. The 49B used
+        # to wedge here generating 300+ lines of redundant ops.
+        self.llm = NemotronClient(model=WORKER_MODEL)
 
     # ------------------------------------------------------------------
     def run(  # type: ignore[override]
@@ -191,6 +199,7 @@ class DatasetAgent(BaseAgent):
                 on_thinking=lambda p: self.emit_event(
                     EventType.THINKING, message=p,
                 ),
+                max_tokens=2000,  # cap plan size; 5 ops × ~150 tokens each
                 no_think=True,  # enum-locked schema; no reasoning needed
             )
             self.emit_event(
