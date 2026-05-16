@@ -483,3 +483,25 @@ def save_model(model, path: Path, compress: int = 3) -> dict[str, Any]:
 
 def load_model(path: Path):
     return joblib.load(path)
+
+def quantize_sklearn_model(model, output_path):
+    """
+    Lightweight sklearn quantization/compression.
+    Converts float64 arrays to float32 where possible
+    and saves compressed artifact.
+    """
+
+    for attr in dir(model):
+        try:
+            value = getattr(model, attr)
+
+            if hasattr(value, "dtype"):
+                if str(value.dtype) == "float64":
+                    setattr(model, attr, value.astype("float32"))
+
+        except Exception:
+            pass
+
+    joblib.dump(model, output_path, compress=3)
+
+    return output_path
