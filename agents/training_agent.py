@@ -762,6 +762,7 @@ def main() -> None:
         X_val=X_test,
         y_val=y_test,
         n_trials=N_OPTUNA_TRIALS,
+        timeout=args.max_time_seconds,
     )
     train_seconds = time.time() - t0
 

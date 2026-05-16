@@ -141,16 +141,8 @@ def run_optuna_search(
     y_val: np.ndarray,
     n_trials: int = 10,
     direction: str = "maximize",
+    timeout: int | None = None,
 ) -> tuple[Any, dict[str, Any], list[dict[str, Any]]]:
-    """Run a small Optuna study around `build_model_fn(**params)`.
-
-    Returns:
-        (best_estimator, best_params, all_trials)
-    where each entry in all_trials is a dict with `params`, `score`, `state`.
-
-    If the class has no known search space, fits build_model() once with
-    no kwargs and returns that as best.
-    """
     search_space = get_search_space(sklearn_class)
     if not search_space:
         model = build_model_fn()
@@ -162,19 +154,15 @@ def run_optuna_search(
 
     def objective(trial: optuna.Trial) -> float:
         params = {n: _suggest(trial, n, spec) for n, spec in search_space.items()}
-        # Hidden_layer_sizes choices are tuples; Optuna stores them as tuples
-        # via `suggest_categorical` (works fine for sklearn).
         try:
             model = build_model_fn(**params)
             model.fit(X_train, y_train)
             return float(model.score(X_val, y_val))
         except Exception:
-            # Bad HP combo (e.g. SVR with bad params on small data) — return
-            # worst-possible score so Optuna avoids this region.
             return -1e9 if direction == "maximize" else 1e9
 
     study = optuna.create_study(direction=direction)
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
 
     best_params = dict(study.best_params)
     best_estimator = build_model_fn(**best_params)
