@@ -110,10 +110,11 @@ def render_agent_detail(
     _render_specialized(run, agent_value)
 
     # --- Recent activity for this agent (expander) ------------------------
-    with st.expander(
-        f"Recent activity · {len(agent_events)} events",
-        expanded=False,
-    ):
+    # Label is intentionally stable (no event count) — Streamlit hashes the
+    # label to identify the widget, and a changing count would reset the
+    # open/closed state on every autorefresh tick.
+    with st.expander("Recent activity", expanded=True):
+        st.caption(f"{len(agent_events)} events")
         if not agent_events:
             st.caption("No events yet.")
         else:
