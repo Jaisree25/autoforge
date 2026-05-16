@@ -1,0 +1,46 @@
+# Pip-only fallback (mirror of environment.yml). Prefer conda for dev:
+#   conda env create -f environment.yml
+# This file exists for environments that can't use conda.
+
+# Core utilities
+pydantic>=2.5
+python-dotenv>=1.0
+sqlalchemy>=2.0
+loguru>=0.7
+rich>=13.0
+typer>=0.12
+
+# Data + light ML
+pandas
+numpy
+scikit-learn
+
+# Test
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# LLM client (Nemotron via NIM = OpenAI-compatible)
+openai>=1.50
+
+# HITL surfaces
+streamlit>=1.30
+streamlit-autorefresh>=1.0
+streamlit-agraph>=0.0.45
+streamlit-extras>=0.4
+python-telegram-bot>=20.7
+plotly>=5.18
+
+# Strategy Agent tools
+tavily-python>=0.5
+arxiv>=2.1
+
+# Training (deepened post-skeleton)
+xgboost>=2.0
+optuna>=3.5
+
+# Data profiling (deepened post-skeleton)
+ydata-profiling>=4.6
+
+# OpenClaw + Nemotron-specific clients — uncomment once install instructions land
+# openclaw
+# nemoclaw

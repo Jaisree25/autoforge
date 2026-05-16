@@ -1,0 +1,73 @@
+# --- Secrets ---
+.env
+.env.local
+*.key
+*.pem
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+.conda/
+
+# --- Test / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# --- Project data (managed by MemoryStore — never commit) ---
+data/autoforge.db
+data/autoforge.db-journal
+data/autoforge.db-wal
+data/autoforge.db-shm
+data/uploads/*
+data/artifacts/*
+!data/uploads/.gitkeep
+!data/artifacts/.gitkeep
+
+# --- Logs ---
+*.log
+logs/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Streamlit ---
+.streamlit/secrets.toml
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# --- ML artifacts (huge; persist via MemoryStore references) ---
+*.pt
+*.pth
+*.onnx
+*.engine
+*.pkl
+wandb/
+mlruns/
