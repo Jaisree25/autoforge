@@ -159,7 +159,7 @@ def _stub_trainer(monkeypatch):
 
     def fake_run(
         self, strategy_spec, training_envelope, dataset_profile,
-        preparation_report=None,
+        preparation_report=None, previous_feedback=None, attempt_num=1,
     ) -> TrainingResult:
         with self._lifecycle("HPO [test stub]"):
             self.emit_event(EventType.INFO, message="test stub: skipping Optuna + fit")

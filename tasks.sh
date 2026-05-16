@@ -41,8 +41,8 @@ invoke_dashboard() {
 }
 
 invoke_run() {
-    dataset="${1:-data/uploads/test.csv}"
-    objective="${2:-predict churn}"
+    dataset="${1:-data/fixtures/mnist}"
+    objective="${2:-classify handwritten digits with accuracy >= 0.90}"
     echo "Running pipeline: dataset=$dataset objective='$objective'"
     python scripts/run_pipeline.py --dataset "$dataset" --objective "$objective"
 }

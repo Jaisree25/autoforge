@@ -70,12 +70,18 @@ def main(
     store.init_schema()
 
     if auto_approve:
-        hitl = AutoApproveHITLService(store)
-        hitl_mode = "auto-approve"
+        # Even in auto-approve, reuse the real Slack bot so the per-agent
+        # Slack feed is still exercised. The auto service just resolves
+        # the approval immediately after broadcasting.
+        real_service = build_hitl_service(store)
+        hitl = AutoApproveHITLService(store, slack=real_service.slack)
+        hitl_mode = (
+            "auto-approve + slack" if real_service.slack else "auto-approve"
+        )
     else:
         hitl = build_hitl_service(store)
-        if getattr(hitl, "telegram", None) is not None:
-            hitl_mode = "dashboard + telegram"
+        if getattr(hitl, "slack", None) is not None:
+            hitl_mode = "dashboard + slack"
         else:
             hitl_mode = "dashboard only"
 

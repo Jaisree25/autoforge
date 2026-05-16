@@ -2,17 +2,19 @@
 
 Stages exercised (all real):
   1. Oracle baseline (sklearn LogReg)
-  2. Generate design.md via Nemotron
-  3. HITL gate — auto-approved here by AutoApproveHITLService
-  4. Generate code/model.py + code/train.py via Nemotron
-  5. Smoke harness on generated code
-  6. Subprocess training (real fit, real best.pkl)
+  2. Generate design.md + model.py + train.py via Nemotron
+  3. Smoke harness on generated code (compile + import + train.py --help)
+  4. HITL gate — auto-approved here by AutoApproveHITLService
+  5. Subprocess training (real fit, real best.pkl)
+  6. Multi-attempt retry loop (up to 5 attempts; no fallback)
   7. Build TrainingResult
 
-Estimated runtime: ~3-5 minutes (two Nemotron calls + training).
-Output artifacts land in `data/artifacts/<run_id>/`:
-  design.md  oracle.json  verify_report.json  code/{model.py,train.py}
-  models/{model_id}.pkl  logs/{train_stdout.log, train_stderr.log}
+Estimated runtime: ~2-6 minutes per attempt (one Nemotron call + training).
+Output artifacts land in `data/artifacts/<run_id>/training/`:
+  in-progress/attempt-N/  (current attempt)
+  failed/attempt-*/       (each failure: design.md, model.py, train.py,
+                           verify_report.json, status.json, logs/)
+  done/attempt-N/         (accepted attempt; same layout + models/best.pkl)
 """
 from __future__ import annotations
 
@@ -161,6 +163,11 @@ def main() -> int:
 
     # --- Summary ---
     run_dir = _PROJECT_ROOT / "data" / "artifacts" / run_id
+    training_root = run_dir / "training"
+    done_dirs = sorted((training_root / "done").iterdir()) if (training_root / "done").is_dir() else []
+    failed_dirs = sorted((training_root / "failed").iterdir()) if (training_root / "failed").is_dir() else []
+    final_attempt = done_dirs[-1] if done_dirs else None
+
     console.rule("[bold green]Trainer summary")
     body = [
         f"[bold]model_id[/]    {training_result.best_model_id}",
@@ -169,28 +176,42 @@ def main() -> int:
         f"[bold]artifact[/]    {training_result.artifact_path}",
         f"[bold]notes[/]       {training_result.notes}",
         "",
-        f"[bold]Per-run dir[/]  {run_dir}",
+        f"[bold]Run dir[/]     {run_dir}",
+        f"[bold]Failed[/]      {len(failed_dirs)} attempt(s)",
+        f"[bold]Done[/]        {final_attempt.name if final_attempt else '—'}",
     ]
-    for p in [
-        "design.md",
-        "oracle.json",
-        "verify_report.json",
-        "code/model.py",
-        "code/train.py",
-        "logs/train_stdout.log",
-    ]:
-        full = run_dir / p
-        if full.exists():
-            body.append(f"  ✓ {p}  ({full.stat().st_size:,} bytes)")
-        else:
-            body.append(f"  ✗ {p}  MISSING")
+    if final_attempt is not None:
+        for p in [
+            "design.md", "model.py", "train.py",
+            "verify_report.json", "status.json",
+            "models/best.pkl", "models/metrics.json",
+        ]:
+            full = final_attempt / p
+            if full.exists():
+                body.append(f"  ✓ {p}  ({full.stat().st_size:,} bytes)")
+            else:
+                body.append(f"  ✗ {p}  MISSING")
+    if failed_dirs:
+        body.append("")
+        body.append("[yellow]Failed attempts (cause from status.json):[/]")
+        for fa in failed_dirs:
+            status_path = fa / "status.json"
+            cause = "(no status.json)"
+            if status_path.exists():
+                try:
+                    s = __import__("json").loads(status_path.read_text())
+                    cause = f"{s.get('status')}: {s.get('reason', '')[:80]}"
+                except Exception:  # noqa: BLE001
+                    pass
+            body.append(f"  • {fa.name}: {cause}")
     console.print(Panel("\n".join(body), border_style="green"))
 
-    # Show design.md preview
-    design = run_dir / "design.md"
-    if design.exists():
-        console.rule("[bold cyan]design.md preview (first 1500 chars)")
-        console.print(design.read_text(encoding="utf-8")[:1500])
+    # Show design.md preview from the winning attempt
+    if final_attempt is not None:
+        design = final_attempt / "design.md"
+        if design.exists():
+            console.rule("[bold cyan]design.md preview (winning attempt, first 1500 chars)")
+            console.print(design.read_text(encoding="utf-8")[:1500])
 
     return 0
 

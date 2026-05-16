@@ -56,10 +56,41 @@ WORKER_MODEL: str = os.getenv(
 TAVILY_API_KEY: str | None = os.getenv("TAVILY_API_KEY")
 
 # ---------------------------------------------------------------------------
-# HITL — Telegram
+# HITL — Slack
 # ---------------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID: str | None = os.getenv("TELEGRAM_CHAT_ID")
+SLACK_BOT_TOKEN: str | None = os.getenv("SLACK_BOT_TOKEN")
+# Main channel — hosts approval requests, Coordinator lifecycle, final results.
+SLACK_CHANNEL_ID: str | None = os.getenv("SLACK_CHANNEL_ID")
+# Optional per-agent channels (env vars use DISPLAY names: Profiler /
+# Researcher / Preparer / Trainer / Evaluator / Optimizer). If a given var
+# is unset, that agent's STARTED/COMPLETED/ERROR events fall back to
+# SLACK_CHANNEL_ID. Channel IDs (Cxxxxxx), not display names.
+SLACK_CHANNEL_PROFILER:  str | None = os.getenv("SLACK_CHANNEL_PROFILER")
+SLACK_CHANNEL_RESEARCHER: str | None = os.getenv("SLACK_CHANNEL_RESEARCHER")
+SLACK_CHANNEL_PREPARER:  str | None = os.getenv("SLACK_CHANNEL_PREPARER")
+SLACK_CHANNEL_TRAINER:   str | None = os.getenv("SLACK_CHANNEL_TRAINER")
+SLACK_CHANNEL_EVALUATOR: str | None = os.getenv("SLACK_CHANNEL_EVALUATOR")
+SLACK_CHANNEL_OPTIMIZER: str | None = os.getenv("SLACK_CHANNEL_OPTIMIZER")
+
+
+def slack_channel_map() -> dict[str, str]:
+    """Return a dict of {AgentName.value → channel_id} for agents that have
+    a dedicated channel configured. The env var names use DISPLAY names
+    (Profiler/Researcher/Preparer/...), the dict keys are internal AgentName
+    values (profiler/strategy/dataset/training/benchmark/hardware) — the
+    code routes by internal name."""
+    mapping: dict[str, str] = {}
+    for agent_value, channel in (
+        ("profiler",  SLACK_CHANNEL_PROFILER),
+        ("strategy",  SLACK_CHANNEL_RESEARCHER),
+        ("dataset",   SLACK_CHANNEL_PREPARER),
+        ("training",  SLACK_CHANNEL_TRAINER),
+        ("benchmark", SLACK_CHANNEL_EVALUATOR),
+        ("hardware",  SLACK_CHANNEL_OPTIMIZER),
+    ):
+        if channel:
+            mapping[agent_value] = channel
+    return mapping
 
 # ---------------------------------------------------------------------------
 # Persistence
@@ -75,12 +106,6 @@ MEMORY_SCHEMA_PATH: Path = MEMORY_DIR / "schema.sql"
 APPROVAL_POLL_INTERVAL: float = 1.0
 APPROVAL_TIMEOUT: float = 600.0  # 10 minutes — generous for live demo
 DASHBOARD_REFRESH_INTERVAL_MS: int = 1500
-
-# ---------------------------------------------------------------------------
-# Agent execution
-# ---------------------------------------------------------------------------
-STUB_AGENT_SLEEP: float = 0.5  # simulated thinking time for skeleton stubs
-AGENT_EVENT_FLUSH: bool = True  # flush events to DB immediately for live trace
 
 # ---------------------------------------------------------------------------
 # Logging

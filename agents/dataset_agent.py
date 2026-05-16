@@ -35,7 +35,6 @@ from contracts.messages import EventType
 from contracts.schemas import (
     AgentName,
     DatasetProfile,
-    Modality,
     PreparationReport,
     StrategySpec,
 )
@@ -46,30 +45,15 @@ from tools import preparation_tools as prep
 
 
 # Canonical op names. Strict json_schema with Literal[...] forces the LLM to
-# pick from exactly these eight values — no aliases, no drift, no "Model
-# Definition" stealing the Trainer's lane.
+# pick from exactly these five values — no aliases, no drift. Image ops were
+# removed when AutoForge narrowed to tabular-sklearn-only.
 PrepOpName = Literal[
-    # Image ops
-    "resize_images",
-    "train_test_split_images",
-    "set_normalization",
-    "set_augmentation",
-    # CSV ops
+    "drop_columns",
     "impute_missing",
     "encode_categoricals",
     "train_test_split_csv",
     "set_feature_scaling",
 ]
-
-
-_IMAGE_OPS: frozenset[str] = frozenset({
-    "resize_images", "train_test_split_images",
-    "set_normalization", "set_augmentation",
-})
-_CSV_OPS: frozenset[str] = frozenset({
-    "impute_missing", "encode_categoricals",
-    "train_test_split_csv", "set_feature_scaling",
-})
 
 
 # ---------------------------------------------------------------------------
@@ -107,62 +91,75 @@ class DatasetAgent(BaseAgent):
         "recommended candidate architectures. Your job is to plan an ordered "
         "list of preparation operations the Trainer needs.\n\n"
         "## Lane discipline (READ THIS FIRST)\n"
-        "You ONLY do data preparation. You DO NOT:\n"
+        "You ONLY do tabular data preparation for sklearn. You DO NOT:\n"
         "  - Define the model architecture (that's the Trainer's job)\n"
         "  - Choose loss functions, optimizers, learning rates, or epochs\n"
         "  - Plan training / evaluation / optimization steps\n"
-        "  - Load data into DataLoaders or batch it\n"
-        "  - Flatten images, convert to tensors, or build pipelines\n"
-        "Those belong to downstream agents. Stick to the eight operations below.\n\n"
-        "## The ONLY operations you may emit\n"
+        "  - Touch image data — AutoForge is CSV/sklearn-only\n"
+        "Stick to the four operations below.\n\n"
+        "## The ONLY operations you may emit (TABULAR CSV)\n"
         "Your output schema enforces these names — anything else is rejected.\n\n"
-        "### For IMAGE datasets:\n"
-        "  - `resize_images`             args: target_h (int), target_w (int)\n"
-        "  - `train_test_split_images`   args: test_size (float, default 0.2)\n"
-        "  - `set_normalization`         args: mean (list[float]), std (list[float])\n"
-        "  - `set_augmentation`          args: transforms (list[str])\n\n"
-        "### For TABULAR (CSV) datasets:\n"
+        "  - `drop_columns`              args: columns (list[str])\n"
         "  - `impute_missing`            args: strategy (str), columns (list[str])\n"
         "  - `encode_categoricals`       args: method (str), columns (list[str])\n"
         "  - `train_test_split_csv`      args: test_size (float), stratify_by (str | null)\n"
         "  - `set_feature_scaling`       args: method (str), columns (list[str])\n\n"
         "## Argument details\n"
-        "- `set_normalization`: For MNIST use `mean=[0.1307], std=[0.3081]`. "
-        "  For ImageNet RGB use `mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]`.\n"
-        "- `set_augmentation` transforms: 'rotation:10', 'translate:0.1', "
-        "  'hflip', 'vflip', 'crop:28', 'brightness:0.1'. "
-        "  Do NOT use 'hflip' on digit-classification (mirrors '6' into '9').\n"
+        "- `drop_columns`: USE THIS FIRST. List columns to remove from the "
+        "feature set. Drop:\n"
+        "    (a) ID-like columns: anything ending in `_id`, `Id`, "
+        "        named `id`, `customer_id`, `user_id`, `uuid`, `PassengerId`. "
+        "        These leak or behave like row indices.\n"
+        "    (b) High-cardinality string columns (>50 unique values), e.g. "
+        "        `Name`, `Ticket`, `Address`. One-hot would explode column count.\n"
+        "    (c) Columns with >50% missing values (e.g. `Cabin`). Imputing "
+        "        them adds more noise than signal.\n"
+        "  NEVER drop the target column.\n"
         "- `impute_missing` strategy: one of `median`, `mean`, `mode`, `drop`.\n"
-        "- `encode_categoricals` method: one of `onehot`, `label`.\n"
+        "- `encode_categoricals` method: one of `onehot`, `label`. Prefer "
+        "`onehot` for low-cardinality features (<10 unique values). DO NOT "
+        "encode the target column. DO NOT encode columns already in "
+        "`drop_columns`.\n"
         "- `set_feature_scaling` method: one of `standard`, `minmax`, `robust`.\n\n"
         "## Required ordering\n"
-        "- Images: (optional resize) → `train_test_split_images` → `set_normalization` → "
-        "  (optional `set_augmentation`).\n"
-        "- CSV: `impute_missing` → `encode_categoricals` → `train_test_split_csv` → "
-        "  (optional `set_feature_scaling`).\n"
-        "- **ALWAYS include a train_test_split op** — the Evaluator needs held-out data.\n\n"
-        "## Worked example output (MNIST)\n"
+        "- Order: `drop_columns` → `impute_missing` → `encode_categoricals` → "
+        "  `train_test_split_csv` → (optional `set_feature_scaling`).\n"
+        "- **ALWAYS include `train_test_split_csv`** — the Evaluator needs "
+        "held-out data.\n"
+        "- Emit EACH op AT MOST ONCE. Do not repeat ops.\n\n"
+        "## Worked example output (Titanic-style binary classification)\n"
+        "Note how `drop_columns` removes PassengerId (ID), Name (high-card "
+        "string), Ticket (high-card), and Cabin (>70% NaN) BEFORE any other op.\n"
         "```json\n"
         "{\n"
         '  "operations": [\n'
         "    {\n"
-        '      "name": "train_test_split_images",\n'
-        '      "args": {"test_size": 0.2},\n'
-        '      "rationale": "Evaluator needs a held-out test set."\n'
+        '      "name": "drop_columns",\n'
+        '      "args": {"columns": ["PassengerId", "Name", "Ticket", "Cabin"]},\n'
+        '      "rationale": "PassengerId is an ID; Name/Ticket are high-cardinality strings; Cabin is >70% missing."\n'
         "    },\n"
         "    {\n"
-        '      "name": "set_normalization",\n'
-        '      "args": {"mean": [0.1307], "std": [0.3081]},\n'
-        '      "rationale": "Standard MNIST normalization stabilizes training."\n'
+        '      "name": "impute_missing",\n'
+        '      "args": {"strategy": "median", "columns": ["Age"]},\n'
+        '      "rationale": "Age has missing values; median is robust to outliers."\n'
         "    },\n"
         "    {\n"
-        '      "name": "set_augmentation",\n'
-        '      "args": {"transforms": ["rotation:10", "translate:0.1"]},\n'
-        '      "rationale": "Mild augmentation helps generalization on tiny dataset."\n'
+        '      "name": "encode_categoricals",\n'
+        '      "args": {"method": "onehot", "columns": ["Sex", "Embarked"]},\n'
+        '      "rationale": "Two low-cardinality categoricals; one-hot preserves the categorical structure."\n'
+        "    },\n"
+        "    {\n"
+        '      "name": "train_test_split_csv",\n'
+        '      "args": {"test_size": 0.2, "stratify_by": "Survived"},\n'
+        '      "rationale": "Stratified 80/20 keeps class balance."\n'
+        "    },\n"
+        "    {\n"
+        '      "name": "set_feature_scaling",\n'
+        '      "args": {"method": "standard", "columns": ["Age", "Fare", "SibSp", "Parch"]},\n'
+        '      "rationale": "Standardize continuous features."\n'
         "    }\n"
         "  ],\n"
-        '  "summary": "Split MNIST 80/20, normalize with standard mean/std, '
-        'add mild rotation+translate augmentation."\n'
+        '  "summary": "Drop ID/text/missing columns, impute age, one-hot categoricals, 80/20 stratified split, standardize numerics."\n'
         "}\n"
         "```\n"
     )
@@ -210,23 +207,44 @@ class DatasetAgent(BaseAgent):
             current_path = source_path
             notes_lines: list[str] = []
             split_applied = False
+            # Accumulates the dicts returned by record_normalization /
+            # record_augmentation / record_feature_scaling. Written to disk at
+            # end of run() so the Trainer's generated train.py can read it.
+            prep_config: dict[str, Any] = {}
+
+            # Defense in depth — the Preparer LLM sometimes emits the same op
+            # multiple times (e.g. `encode_categoricals` 7 times in a row),
+            # which compounds disasters (encoding the target column away,
+            # blowing up cardinality on ID columns). Dedupe by op name so each
+            # operation runs at most once per plan.
+            seen_op_names: set[str] = set()
 
             for op in plan.operations:
-                # Skip ops that target the wrong modality (LLM rarely does
-                # this with the enum, but cheap to check).
-                if dataset_profile.modality == Modality.IMAGE and op.name in _CSV_OPS:
+                if op.name in seen_op_names:
                     self.emit_event(
                         EventType.WARNING,
-                        message=f"skipping `{op.name}` (CSV op on image dataset)",
+                        message=(
+                            f"skipping duplicate `{op.name}` "
+                            "(already applied earlier in the plan)"
+                        ),
                     )
                     continue
-                if dataset_profile.modality == Modality.TABULAR and op.name in _IMAGE_OPS:
-                    self.emit_event(
-                        EventType.WARNING,
-                        message=f"skipping `{op.name}` (image op on tabular dataset)",
-                    )
-                    continue
+                seen_op_names.add(op.name)
 
+                # Target-column protection — strip target from any
+                # columns-list arg so we never encode/scale the y vector.
+                target_col = dataset_profile.target_column
+                if target_col and "columns" in op.args:
+                    cols = op.args.get("columns") or []
+                    if isinstance(cols, list) and target_col in cols:
+                        op.args["columns"] = [c for c in cols if c != target_col]
+                        self.emit_event(
+                            EventType.WARNING,
+                            message=(
+                                f"stripped target `{target_col}` from "
+                                f"`{op.name}` columns arg (target stays raw)"
+                            ),
+                        )
                 args_preview = json.dumps(op.args, default=str)
                 if len(args_preview) > 100:
                     args_preview = args_preview[:97] + "…"
@@ -239,11 +257,12 @@ class DatasetAgent(BaseAgent):
                 try:
                     new_path, note = self._dispatch_op(
                         op, current_path, dataset_profile, artifact_dir,
+                        prep_config,
                     )
                     applied_ops.append(
                         f"{op.name}({json.dumps(op.args, default=str)})"
                     )
-                    if op.name in ("train_test_split_images", "train_test_split_csv"):
+                    if op.name == "train_test_split_csv":
                         split_applied = True
                     if note:
                         notes_lines.append(f"{op.name}: {note}")
@@ -275,10 +294,29 @@ class DatasetAgent(BaseAgent):
             if current_path != source_path:
                 prepared_path = str(current_path)
 
+            # Persist accumulated config so the Trainer's train.py can read it.
+            prep_config_path: str | None = None
+            if prep_config:
+                config_path = artifact_dir / "prep_config.json"
+                config_path.write_text(
+                    json.dumps(prep_config, indent=2, default=str),
+                    encoding="utf-8",
+                )
+                prep_config_path = str(config_path)
+                self.emit_event(
+                    EventType.INFO,
+                    message=(
+                        f"wrote prep_config.json with "
+                        f"{', '.join(prep_config.keys())}"
+                    ),
+                    payload={"prep_config_path": prep_config_path},
+                )
+
             report = PreparationReport(
                 original_dataset_path=str(source_path),
                 prepared_dataset_path=prepared_path,
                 operations=applied_ops,
+                prep_config_path=prep_config_path,
                 summary=plan.summary,
                 notes="\n".join(notes_lines),
             )
@@ -299,28 +337,18 @@ class DatasetAgent(BaseAgent):
     ) -> str:
         lines = [
             "## Dataset profile (from Profiler)",
-            f"- Modality: `{profile.modality.value}`",
+            f"- Modality: `{profile.modality.value}` (tabular CSV)",
             f"- Inferred task: `{profile.task_type.value}`",
             f"- Samples: {profile.n_rows:,}",
+            f"- Columns: {profile.n_cols}",
+            f"- Target: `{profile.target_column}`",
         ]
-        if profile.modality == Modality.TABULAR:
-            lines += [
-                f"- Columns: {profile.n_cols}",
-                f"- Target: `{profile.target_column}`",
-            ]
-            if profile.columns:
-                lines.append("- Column details:")
-                for c in profile.columns[:20]:
-                    lines.append(
-                        f"  - `{c.name}` ({c.dtype}, missing={c.missing_pct:.1%})"
-                    )
-        else:
-            lines += [
-                f"- Classes: {profile.n_classes}",
-                f"- Channels: {profile.image_channels}",
-                f"- Sample resolutions: {profile.image_resolutions[:5]}",
-                f"- Formats: {profile.image_formats}",
-            ]
+        if profile.columns:
+            lines.append("- Column details:")
+            for c in profile.columns[:20]:
+                lines.append(
+                    f"  - `{c.name}` ({c.dtype}, missing={c.missing_pct:.1%})"
+                )
         if profile.class_balance:
             lines.append(
                 "- Class balance: "
@@ -366,54 +394,32 @@ class DatasetAgent(BaseAgent):
         one so downstream agents don't crash. INFO-level event so the
         human sees it in the dashboard.
         """
-        if profile.modality == Modality.IMAGE:
-            out_dir = artifact_dir / "split"
-            self.emit_event(
-                EventType.INFO,
-                message="auto-split backstop: LLM omitted split → applying default 80/20",
+        out_dir = artifact_dir / "split"
+        self.emit_event(
+            EventType.INFO,
+            message="auto-split backstop: LLM omitted split → applying default 80/20",
+        )
+        # Don't stratify on regression targets — they're continuous so
+        # sklearn's stratified split would fail "too few members per class".
+        is_regression = profile.task_type.value == "regression"
+        stratify_target = None if is_regression else profile.target_column
+        try:
+            result = prep.split_train_test_csv(
+                source_path=current_path,
+                test_size=0.2,
+                stratify_by=stratify_target,
+                output_dir=out_dir,
             )
-            try:
-                result = prep.split_image_dir(
-                    source_dir=current_path,
-                    test_size=0.2,
-                    output_dir=out_dir,
-                )
-                return (
-                    Path(result["output_dir"]),
-                    f"train={result['train_count']}, test={result['test_count']}",
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.emit_event(
-                    EventType.WARNING,
-                    message=f"auto-split backstop FAILED: {type(exc).__name__}: {exc}",
-                )
-                return current_path, ""
-
-        if profile.modality == Modality.TABULAR:
-            out_dir = artifact_dir / "split"
-            self.emit_event(
-                EventType.INFO,
-                message="auto-split backstop: LLM omitted split → applying default 80/20",
+            return (
+                Path(result["output_dir"]),
+                f"train={result['train_count']}, test={result['test_count']}",
             )
-            try:
-                result = prep.split_train_test_csv(
-                    source_path=current_path,
-                    test_size=0.2,
-                    stratify_by=profile.target_column,
-                    output_dir=out_dir,
-                )
-                return (
-                    Path(result["output_dir"]),
-                    f"train={result['train_count']}, test={result['test_count']}",
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.emit_event(
-                    EventType.WARNING,
-                    message=f"auto-split backstop FAILED: {type(exc).__name__}: {exc}",
-                )
-                return current_path, ""
-
-        return current_path, ""
+        except Exception as exc:  # noqa: BLE001
+            self.emit_event(
+                EventType.WARNING,
+                message=f"auto-split backstop FAILED: {type(exc).__name__}: {exc}",
+            )
+            return current_path, ""
 
     # ------------------------------------------------------------------
     def _dispatch_op(
@@ -422,57 +428,60 @@ class DatasetAgent(BaseAgent):
         current_path: Path,
         profile: DatasetProfile,
         artifact_dir: Path,
+        prep_config: dict[str, Any],
     ) -> tuple[Path | None, str]:
         """Apply one operation. Returns (new_path | None, human-readable note).
 
-        `new_path` is None for config-only ops (normalization, augmentation,
-        feature_scaling). Op names are already canonical (enum-enforced),
-        so no aliasing needed.
+        `new_path` is None for config-only ops (feature_scaling). Those
+        mutate `prep_config` in place so the agent can persist the
+        accumulated config at end of run().
         """
         name = op.name
         args = op.args
 
-        # === Image ops ===
-        if name == "resize_images":
-            target_h = int(args.get("target_h", 28))
-            target_w = int(args.get("target_w", 28))
-            out_dir = artifact_dir / f"resized_{target_h}x{target_w}"
-            result = prep.resize_images_dir(
-                source_dir=current_path,
-                target_h=target_h, target_w=target_w,
-                output_dir=out_dir,
-            )
-            return (
-                Path(result["output_dir"]),
-                f"resized {result['resized_count']} images to "
-                f"{target_h}×{target_w}",
-            )
+        # LLM frequently emits `column` (singular string) instead of `columns`
+        # (plural list). Coerce so downstream filtering sees a list.
+        if "column" in args and "columns" not in args:
+            single = args.pop("column")
+            if isinstance(single, str):
+                args["columns"] = [single]
+            elif isinstance(single, list):
+                args["columns"] = single
+            else:
+                args["columns"] = []
+        # Also normalize `strategy` vs `method` mix-ups for encode op.
+        if name == "encode_categoricals" and "strategy" in args and "method" not in args:
+            args["method"] = args.pop("strategy")
 
-        if name == "train_test_split_images":
-            test_size = float(args.get("test_size", 0.2))
-            out_dir = artifact_dir / "split"
-            result = prep.split_image_dir(
-                source_dir=current_path,
-                test_size=test_size,
-                output_dir=out_dir,
-            )
-            return (
-                Path(result["output_dir"]),
-                f"train={result['train_count']}, test={result['test_count']}",
-            )
+        # === CSV ops (the only ops AutoForge supports — sklearn-tabular only) ===
+        if name == "drop_columns":
+            cols_to_drop = list(args.get("columns") or [])
+            # Target-column protection happens up-front in run() already,
+            # so the target is never in this list. Defense in depth:
+            target_col = profile.target_column
+            if target_col and target_col in cols_to_drop:
+                cols_to_drop = [c for c in cols_to_drop if c != target_col]
+            if not cols_to_drop:
+                return None, "no columns to drop"
+            import pandas as pd
+            df = pd.read_csv(current_path)
+            existing = [c for c in cols_to_drop if c in df.columns]
+            missing = [c for c in cols_to_drop if c not in df.columns]
+            if missing:
+                self.emit_event(
+                    EventType.WARNING,
+                    message=(
+                        f"drop_columns: skipping non-existent columns "
+                        f"{missing!r}"
+                    ),
+                )
+            if not existing:
+                return None, "no columns to drop (all missing from CSV)"
+            df = df.drop(columns=existing)
+            out_path = artifact_dir / (current_path.stem + "_dropped.csv")
+            df.to_csv(out_path, index=False)
+            return Path(out_path), f"dropped {existing!r}"
 
-        if name == "set_normalization":
-            mean = list(args.get("mean", []))
-            std = list(args.get("std", []))
-            prep.record_normalization(mean=mean, std=std)
-            return None, f"mean={mean}, std={std}"
-
-        if name == "set_augmentation":
-            transforms = list(args.get("transforms", []))
-            prep.record_augmentation(transforms=transforms)
-            return None, f"transforms={transforms}"
-
-        # === CSV ops ===
         if name == "impute_missing":
             strategy = str(args.get("strategy", "median"))
             columns = args.get("columns") or None
@@ -491,11 +500,44 @@ class DatasetAgent(BaseAgent):
         if name == "encode_categoricals":
             method = str(args.get("method", "onehot"))
             columns = list(args.get("columns", []))
+            # Guard against high-cardinality ID columns and the target.
+            # One-hot encoding `customer_id` on a 500-row dataset would
+            # explode into 500 columns and trash downstream Trainer code.
+            target_col = profile.target_column
+            skipped = []
+            safe_columns: list[str] = []
+            for col in columns:
+                if target_col and col == target_col:
+                    skipped.append(col)
+                    continue
+                if any(suffix in col.lower() for suffix in (
+                    "_id", "customer_id", "user_id", "id_", "uuid",
+                )) or col.lower() == "id":
+                    skipped.append(col)
+                    continue
+                safe_columns.append(col)
+            if skipped:
+                self.emit_event(
+                    EventType.WARNING,
+                    message=(
+                        f"encode_categoricals skipped high-risk columns "
+                        f"{skipped} (target / ID-like / high-cardinality)"
+                    ),
+                )
+            if not safe_columns:
+                self.emit_event(
+                    EventType.INFO,
+                    message=(
+                        "encode_categoricals: no safe columns to encode "
+                        "after filtering — skipping op"
+                    ),
+                )
+                return None, "no columns to encode (all filtered)"
             out_path = artifact_dir / (current_path.stem + "_encoded.csv")
             result = prep.encode_categoricals_csv(
                 source_path=current_path,
                 method=method,
-                columns=columns,
+                columns=safe_columns,
                 output_path=out_path,
             )
             return (
@@ -506,6 +548,9 @@ class DatasetAgent(BaseAgent):
         if name == "train_test_split_csv":
             test_size = float(args.get("test_size", 0.2))
             stratify_by = args.get("stratify_by") or profile.target_column
+            # Disable stratification for regression targets (continuous → fails).
+            if profile.task_type.value == "regression":
+                stratify_by = None
             out_dir = artifact_dir / "split"
             result = prep.split_train_test_csv(
                 source_path=current_path,
@@ -521,7 +566,9 @@ class DatasetAgent(BaseAgent):
         if name == "set_feature_scaling":
             method = str(args.get("method", "standard"))
             columns = list(args.get("columns", []))
-            prep.record_feature_scaling(method=method, columns=columns)
+            prep_config.update(prep.record_feature_scaling(
+                method=method, columns=columns,
+            ))
             return None, f"method={method}, columns={columns}"
 
         # Unreachable: Literal enum guarantees one of the above.

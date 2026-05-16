@@ -55,6 +55,18 @@ class StrategyAgent(BaseAgent):
         "you an objective. Your job is to compose a structured `StrategySpec` "
         "with 2-3 candidate architectures the Trainer should consider, backed "
         "by real citations.\n\n"
+        "## CRITICAL CONSTRAINT — sklearn only\n"
+        "AutoForge runs sklearn-only by design (no GPU, no PyTorch, no "
+        "TensorFlow). Every `candidate_architectures[].library` MUST be "
+        "`sklearn`. Pick architectures from this whitelist:\n"
+        "  - `MLPClassifier` (sklearn.neural_network) — the closest thing to "
+        "    a neural net we have; use this for image/text/non-linear tasks.\n"
+        "  - `LogisticRegression`, `RandomForestClassifier`, "
+        "    `GradientBoostingClassifier`, `SVC`, `KNeighborsClassifier`, "
+        "    `DecisionTreeClassifier`.\n"
+        "DO NOT propose PyTorch/Keras CNNs, transformers, ResNet, LeNet, "
+        "ViT, etc. Even for image data, MLPClassifier on flattened pixels "
+        "is the recipe — it works fine on small image sets.\n\n"
         "## Inputs you'll receive\n"
         "- The profile (modality, task, sample count, class info).\n"
         "- The user's objective text.\n"
@@ -64,10 +76,10 @@ class StrategyAgent(BaseAgent):
         "  tool access on this turn. The searches already ran.\n\n"
         "## HARD REQUIREMENTS for the output\n"
         "- **candidate_architectures: at least 2 entries.** Always include a "
-        "  simple baseline (e.g., logistic regression, MLP) alongside the "
-        "  strong recommendation. Variety helps the human pick a fit for the "
-        "  budget. Each candidate needs name + family + library + a 1-line "
-        "  rationale + hyperparameter_space dict.\n"
+        "  simple baseline (e.g., LogisticRegression) alongside the strong "
+        "  recommendation. Variety helps the human pick a fit for the budget. "
+        "  Each candidate needs name + family + `library='sklearn'` + a "
+        "  1-line rationale + hyperparameter_space dict.\n"
         "- **citations: at least 1 arXiv URL** (starts with `https://arxiv.org/`). "
         "  Use the pre-fetched arXiv results — they're real papers.\n"
         "- **success_metric: lowercase canonical form.** Use `f1`, `accuracy`, "
@@ -166,6 +178,11 @@ class StrategyAgent(BaseAgent):
                         "candidate architecture(s); prompt asked for ≥2"
                     ),
                 )
+
+            # Defense in depth — coerce every candidate to sklearn. The 49B
+            # model is stubborn about MNIST + PyTorch CNN even with a
+            # CRITICAL CONSTRAINT in the system prompt; just normalize.
+            spec = self._coerce_sklearn_candidates(spec)
 
             # arXiv citation backstop — even though we already prefetched
             # arxiv, the LLM might have ignored those citations.
@@ -274,6 +291,57 @@ class StrategyAgent(BaseAgent):
         tavily_out = _dedup_by_key(tavily_out, "url")
         arxiv_out = _dedup_by_key(arxiv_out, "url")
         return tavily_out, arxiv_out
+
+    # ------------------------------------------------------------------
+    def _coerce_sklearn_candidates(self, spec: StrategySpec) -> StrategySpec:
+        """Force every candidate's library to `sklearn`. If the LLM proposed a
+        CNN / ResNet / transformer family, remap to MLPClassifier — the
+        closest sklearn equivalent.
+        """
+        coerced = []
+        any_changed = False
+        for arch in spec.candidate_architectures:
+            new_arch = arch
+            if arch.library.lower() != "sklearn":
+                any_changed = True
+                family_l = arch.family.lower()
+                # CNN/ResNet/transformer/LeNet → MLPClassifier
+                if any(k in family_l for k in (
+                    "cnn", "conv", "resnet", "vit", "transformer", "lenet",
+                )) or any(k in arch.name.lower() for k in (
+                    "cnn", "conv", "resnet", "vit", "lenet",
+                )):
+                    new_arch = arch.model_copy(update={
+                        "name": "MLPClassifier (sklearn substitute for "
+                                f"{arch.name})",
+                        "family": "neural_net",
+                        "library": "sklearn",
+                        "rationale": (
+                            f"AutoForge is sklearn-only. Substituted "
+                            f"MLPClassifier on flattened pixels for the "
+                            f"originally-proposed `{arch.name}` "
+                            f"({arch.family}/{arch.library})."
+                        ),
+                        "hyperparameter_space": {
+                            "hidden_layer_sizes": [(128, 64)],
+                            "alpha": [1e-3],
+                            "learning_rate_init": [1e-3],
+                            "max_iter": [200],
+                        },
+                    })
+                else:
+                    new_arch = arch.model_copy(update={"library": "sklearn"})
+            coerced.append(new_arch)
+        if any_changed:
+            self.emit_event(
+                EventType.WARNING,
+                message=(
+                    "coerced non-sklearn library on "
+                    f"{sum(1 for a, b in zip(spec.candidate_architectures, coerced) if a is not b)} "
+                    "candidate(s) — AutoForge is sklearn-only"
+                ),
+            )
+        return spec.model_copy(update={"candidate_architectures": coerced})
 
     # ------------------------------------------------------------------
     def _ensure_arxiv_citation(

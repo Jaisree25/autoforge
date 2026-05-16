@@ -214,6 +214,10 @@ class PreparationReport(_Base):
     original_dataset_path: str
     prepared_dataset_path: str | None = None
     operations: list[str] = Field(default_factory=list)  # ["impute_median(age)", "resize(224x224)", ...]
+    # JSON file recording the Preparer's config-only decisions (normalization
+    # mean/std, augmentation transforms, feature scaling method). The Trainer's
+    # generated train.py reads this so the operations actually take effect.
+    prep_config_path: str | None = None
     summary: str = ""
     notes: str = ""
 

@@ -1,24 +1,24 @@
-"""Agentic Trainer pipeline — port of the user's `agentic-pipeline` pattern.
+"""Agentic Trainer pipeline.
 
 The TrainingAgent drives this in stages:
 
-  1. **Oracle baseline** — sklearn LogisticRegression on flattened input.
-     Defines the "must beat by 5 points" sanity gate.
-  2. **Generate design.md** — Nemotron writes architecture + hyperparams +
-     wall-clock estimate as Markdown. Trainer pauses for HITL approval.
-  3. **Generate code** — Nemotron writes `model.py`, `train.py`, `eval.py`
-     into `data/artifacts/<run_id>/code/`. Sklearn-based for fast iteration.
-  4. **Smoke harness** — verify the generated code: py_compile, import,
-     `build_model()` runs, param count reasonable. Emits structured
-     `verify_report.json` with one `ERROR`-prefixed line per failed check.
-  5. **Subprocess training** — run `code/train.py` with wall-clock cap.
-     Captures stdout/stderr to `logs/`. Soft-success if best.pkl exists
-     even after timeout.
-  6. **Load + return** — read best.pkl + final metrics into TrainingResult.
+  1. Oracle baseline (sklearn LogReg) — the "must beat by 5 points" gate.
+  2. **Generate design.md + model.py** — Nemotron writes both from the
+     upstream Profiler/Researcher/Preparer context. AutoForge writes the
+     templated train.py (modality-specific, reads prep_config.json at
+     runtime to apply normalization or feature_scaling automatically).
+  3. **Smoke harness** — verify generated code: py_compile, import,
+     `build_model()` instantiates, `train.py --help` works. Failures feed
+     back to the LLM as retry context.
+  4. **HITL gate on design.md** — fires once, after the first smoke-passing
+     attempt, before any training subprocess runs.
+  5. **Subprocess training** — run train.py with a wall-clock cap. Capture
+     stdout/stderr. Runtime failures also feed back as retry context.
+  6. **Build + return TrainingResult** — read best.pkl + metrics.json from
+     the accepted attempt directory.
 
-When this pattern matures, it'll absorb the multi-session restart + stuck
-detector from the user's `agentic-pipeline` project. For now it's
-single-shot per stage.
+Each attempt lives in its own folder under `training/in-progress/attempt-N/`
+and is moved into `training/failed/` or `training/done/` based on outcome.
 """
 from __future__ import annotations
 
@@ -29,13 +29,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
 from agents._llm_client import NemotronClient
 from contracts.schemas import (
     DatasetProfile,
-    Modality,
     PreparationReport,
     StrategySpec,
     TrainingEnvelope,
@@ -55,49 +53,45 @@ def run_oracle(
 
     The oracle plays the same role as GCC in the C-compiler project: a
     known-good baseline the generated model must beat by ≥5 points.
+    For classification: sklearn LogReg, scored by accuracy.
+    For regression:     sklearn LinReg, scored by R².
     """
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import accuracy_score
-
     t0 = time.time()
-    if profile.modality == Modality.IMAGE:
-        prepared = (
-            Path(prep.prepared_dataset_path)
-            if (prep and prep.prepared_dataset_path) else None
+    is_regression = _is_regression_task(profile)
+    target = profile.target_column or "target"
+    prepared_dir = (
+        Path(prep.prepared_dataset_path)
+        if (prep and prep.prepared_dataset_path) else None
+    )
+    X_train, y_train, X_test, y_test = tt.load_csv_split_or_full(
+        prepared_dir=prepared_dir,
+        fallback_csv=Path(profile.dataset_path),
+        target_column=target,
+    )
+    if X_test is None or y_test is None:
+        from sklearn.model_selection import train_test_split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_train, y_train, test_size=0.2, random_state=42,
         )
-        if prepared and (prepared / "train").is_dir() and (prepared / "test").is_dir():
-            X_train, y_train, _ = tt.load_image_folder(prepared / "train")
-            X_test, y_test, _ = tt.load_image_folder(prepared / "test")
-        else:
-            from sklearn.model_selection import train_test_split
-            X, y, _ = tt.load_image_folder(Path(profile.dataset_path))
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=y,
-            )
-    else:
-        target = profile.target_column or "target"
-        prepared_dir = (
-            Path(prep.prepared_dataset_path)
-            if (prep and prep.prepared_dataset_path) else None
-        )
-        X_train, y_train, X_test, y_test = tt.load_csv_split_or_full(
-            prepared_dir=prepared_dir,
-            fallback_csv=Path(profile.dataset_path),
-            target_column=target,
-        )
-        if X_test is None or y_test is None:
-            from sklearn.model_selection import train_test_split
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_train, y_train, test_size=0.2, random_state=42,
-            )
 
-    model = LogisticRegression(max_iter=300, n_jobs=-1)
-    model.fit(X_train, y_train)
-    acc = float(accuracy_score(y_test, model.predict(X_test)))
+    if is_regression:
+        from sklearn.linear_model import LinearRegression
+        from sklearn.metrics import r2_score
+        model = LinearRegression()
+        model.fit(X_train, y_train)
+        acc = float(r2_score(y_test, model.predict(X_test)))
+        oracle_model_name = "sklearn.linear_model.LinearRegression"
+    else:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import accuracy_score
+        model = LogisticRegression(max_iter=300)
+        model.fit(X_train, y_train)
+        acc = float(accuracy_score(y_test, model.predict(X_test)))
+        oracle_model_name = "sklearn.linear_model.LogisticRegression"
     wall = time.time() - t0
 
     oracle = {
-        "model": "sklearn.linear_model.LogisticRegression",
+        "model": oracle_model_name,
         "test_accuracy": acc,
         "wall_clock_s": wall,
         "n_train": int(X_train.shape[0]),
@@ -109,331 +103,159 @@ def run_oracle(
 
 
 # ===========================================================================
-# Stage 2 + 3 (combined): Generate design.md AND code in ONE call.
-# Avoids: (a) two sequential ~3min Nemotron round-trips, (b) restating what
-# Profiler/Researcher/Preparer already wrote — the model is explicitly told
-# those upstream agents already own the architectural and dataset reasoning.
+# Stage 2a: Generate design.md (LLM call 1, before HITL gate).
+# Stage 2b: Generate model.py (LLM call 2, after HITL approves the design).
+# Split into two calls so the human reviews the design BEFORE the code
+# locks in. Each call is small (single artifact) so it's fast on the 9B.
 # ===========================================================================
-class _DesignAndCode(BaseModel):
-    """Structured output: design.md + model.py.
-
-    train.py is NOT generated by the LLM — it's a templated runner owned by
-    AutoForge. The LLM is bug-prone about data-loading (invents `np.load`
-    paths, expects CSV when given images, etc.). Separating "creative
-    architecture choice" (model.py) from "mechanical execution" (train.py)
-    keeps the smoke harness honest AND speeds up codegen.
-
-    design.md mirrors the agentic-pipeline pattern: it's a SOLID commitment
-    doc the human reviews and the train.py runner uses as ground truth.
-    Required sections:
-      1. ## Architecture commitment       — concrete class + why over runner-up
-      2. ## Hyperparameters (final)       — each value WITH per-line rationale
-      3. ## Wall-clock budget             — estimate + overrun policy
-      4. ## Success criteria              — hard target + oracle delta
-      5. ## Risks & anti-patterns         — known traps for this arch+data
-      6. ## Code structure                — what model.py exports
-      7. ## Verification plan             — what the harness should check
-    """
-    model_config = ConfigDict(extra="forbid")
-    design_md: str = Field(
-        description=(
-            "Markdown design doc (~400-700 words). MUST have all 7 sections "
-            "listed in the system prompt. Concrete values everywhere — no "
-            "ranges, no `tbd`, no `~`. Every hyperparameter line has a rationale."
-        ),
+def _build_design_user_prompt(
+    spec: StrategySpec,
+    profile: DatasetProfile,
+    envelope: TrainingEnvelope,
+    oracle: dict[str, Any],
+    prep: PreparationReport | None,
+    prep_config: dict[str, Any] | None,
+) -> str:
+    arch = spec.candidate_architectures[0] if spec.candidate_architectures else None
+    prepared_path = (
+        prep.prepared_dataset_path if (prep and prep.prepared_dataset_path)
+        else profile.dataset_path
     )
-    model_py: str = Field(
-        description=(
-            "Contents of code/model.py. Defines exactly one function "
-            "`build_model()` returning an unfitted sklearn estimator with the "
-            "exact hyperparameter values committed to in design.md. "
-            "No `if __name__ == '__main__'` — this file is imported only. "
-            "Top-level code may import sklearn modules but MUST NOT do any I/O."
-        ),
+    effective_target = max(
+        spec.success_threshold, oracle["test_accuracy"] + 0.05,
     )
+    lines = [
+        "## Inputs",
+        f"- Modality: tabular CSV (sklearn-only)",
+        f"- Task: `{profile.task_type.value}`",
+        f"- Target column: `{profile.target_column}`",
+        f"- Prepared data dir: `{prepared_path}`",
+        f"- Samples: {profile.n_rows:,} × {profile.n_cols} columns",
+        f"- Wall-clock cap: {envelope.max_train_minutes * 60:.0f}s",
+        "",
+        "## Targets",
+        f"- Hard: `{spec.success_metric}` ≥ {spec.success_threshold:.3f}",
+        f"- Oracle baseline (sklearn LogReg): test_accuracy = {oracle['test_accuracy']:.3f}",
+        f"- Effective target (max of hard + oracle+0.05): ≥ {effective_target:.3f}",
+        "",
+        "## Researcher's committed architecture (already picked at HITL)",
+    ]
+    if arch is not None:
+        lines.append(f"- Name: `{arch.name}` ({arch.family} / `{arch.library}`)")
+        lines.append(f"- Rationale: {arch.rationale}")
+        lines.append(f"- Hyperparameter space: `{arch.hyperparameter_space}`")
+    if prep is not None and prep.operations:
+        lines.append("")
+        lines.append("## Preparer's applied operations")
+        for op in prep.operations:
+            lines.append(f"- `{op}`")
+    if prep_config:
+        lines.append("")
+        lines.append("## Preparer's prep_config (applied by train.py at runtime)")
+        lines.append("```json")
+        lines.append(json.dumps(prep_config, indent=2, default=str))
+        lines.append("```")
+    lines.append("")
+    lines.append(
+        "Write design.md now — Markdown prose, ~150-300 words total, "
+        "all 7 required headers in order. Concrete values in Hyperparameters."
+    )
+    return "\n".join(lines)
 
 
-def generate_design_and_code(
+def generate_design_md(
     llm: NemotronClient,
     spec: StrategySpec,
     profile: DatasetProfile,
     envelope: TrainingEnvelope,
     oracle: dict[str, Any],
     prep: PreparationReport | None,
+    prep_config: dict[str, Any] | None = None,
     on_thinking=None,
-    no_think: bool = True,
-    previous_errors: list[str] | None = None,
-) -> dict[str, str]:
-    """ONE Nemotron call → {design_md, model.py, train.py}. ~30-60s in /no_think.
-
-    The system prompt explicitly tells the model NOT to re-derive things the
-    upstream agents already produced (architecture rationale, dataset
-    description, preparation steps). It just commits to specifics + generates
-    runnable sklearn code.
-
-    `previous_errors`: if set, this is a retry — the listed errors from the
-    last smoke harness run get appended to the user prompt so the model can
-    fix them. Mirrors the agentic-pipeline `failures.md` feedback pattern.
-    """
-    arch = spec.candidate_architectures[0] if spec.candidate_architectures else None
-    prepared_path = (
-        prep.prepared_dataset_path if (prep and prep.prepared_dataset_path)
-        else profile.dataset_path
-    )
-
-    system = (
-        "You are the Trainer agent in the AutoForge pipeline. Upstream agents "
-        "have ALREADY produced:\n"
-        "  - Profiler: a DatasetProfile (modality, shape, target, task type)\n"
-        "  - Researcher: a StrategySpec with ONE committed architecture (the "
-        "    human just picked it at the candidate-pick HITL gate) plus "
-        "    rationale + hyperparameter space + citations.\n"
-        "  - Preparer: a PreparationReport with a prepared train/test split.\n\n"
-        "DO NOT re-derive any of this. Your job is to COMMIT and SHIP a "
-        "solid design.md + model.py.\n\n"
-        "Produce TWO artifacts as one structured JSON object:\n\n"
-        "================================================================\n"
-        "## 1. design.md — solid commitment doc (~400-700 words)\n"
-        "================================================================\n"
-        "This is the contract the human approves at the design-gate HITL "
-        "and what the train.py runner trusts as ground truth. Write it like "
-        "an engineer who knows they'll be paged if it's wrong.\n\n"
-        "REQUIRED sections (in this exact order, with these exact headings):\n\n"
-        "### `## Architecture commitment`\n"
-        "- The concrete sklearn class you're using (e.g. `MLPClassifier`).\n"
-        "- One sentence: why this over the OTHER candidate(s) the Researcher "
-        "  proposed (if any). Speak to dataset-specific traits.\n"
-        "- One sentence: what aspect of the dataset makes this a good fit.\n\n"
-        "### `## Hyperparameters (final)`\n"
-        "Every hyperparameter on its own line, EXACT value, with a 1-line "
-        "rationale. Format strictly:\n"
-        "  - `param_name = value`  — Why this value.\n"
-        "Example:\n"
-        "  - `hidden_layer_sizes = (128, 64)` — Two-layer MLP: 128 captures "
-        "    pixel-level features, 64 separates classes. Total ~110k params, "
-        "    well under the envelope cap.\n"
-        "  - `alpha = 1e-3` — Mild L2; dataset is small so we lean toward "
-        "    regularization rather than wider layers.\n"
-        "  - `max_iter = 30` — Enough for convergence on a tiny set without "
-        "    blowing the 60s wall-clock.\n"
-        "  - `random_state = 42` — Reproducibility.\n"
-        "NO ranges. NO `tbd`. NO `~`. Pick ONE value for every HP your sklearn "
-        "class supports that you intend to set.\n\n"
-        "### `## Wall-clock budget`\n"
-        "- Estimated train time on the prepared dataset (real seconds).\n"
-        "- The cap from the envelope (must respect `max_train_minutes × 60`).\n"
-        "- What we do if we hit the cap: reduce epochs? early-stop? abort?\n\n"
-        "### `## Success criteria`\n"
-        "- Hard target: `<metric>` ≥ `<threshold>` (from StrategySpec).\n"
-        "- Oracle delta: must beat the sklearn LogReg baseline by ≥ 0.05.\n"
-        "- State the oracle's measured test_accuracy so the delta is concrete.\n"
-        "- Rollback trigger: one specific condition under which the run aborts "
-        "  (e.g., `val_loss NaN after 3 epochs`, `accuracy ≤ oracle - 0.05`).\n\n"
-        "### `## Risks & anti-patterns`\n"
-        "- One concrete risk for THIS architecture on THIS dataset shape "
-        "  (e.g., MLP on 28×28 grayscale → underfits without enough hidden "
-        "  units; or trees on tiny sets → high variance).\n"
-        "- One concrete anti-pattern we're avoiding (and why).\n"
-        "- Overfitting risk given dataset size: one sentence.\n\n"
-        "### `## Code structure`\n"
-        "- `model.py` exports: `build_model() -> sklearn estimator`.\n"
-        "- `train.py` is AutoForge-templated (do NOT generate). It will:\n"
-        "  - Load `<data-dir>/train/` and `<data-dir>/test/` (image) OR "
-        "    `train.csv` + `test.csv` (CSV).\n"
-        "  - Call `model = build_model()` then `model.fit(X_train, y_train)`.\n"
-        "  - Save `best.pkl` and emit `metrics.json` with `val_accuracy` + "
-        "    `train_seconds`.\n"
-        "- Required estimator surface: `.fit(X, y)` + `.predict(X)`.\n\n"
-        "### `## Verification plan`\n"
-        "- Smoke harness checks: `py_compile model.py`, `import build_model`, "
-        "  `build_model()` instantiates without error.\n"
-        "- After training: assert `val_accuracy >= oracle_accuracy + 0.05`.\n"
-        "- Manual review: confirm the saved `best.pkl` loads with `joblib.load`.\n\n"
-        "================================================================\n"
-        "## 2. model.py — minimal, sklearn-only\n"
-        "================================================================\n"
-        "Defines EXACTLY one function `build_model()` returning an unfitted "
-        "estimator with the EXACT hyperparameter values you committed to in "
-        "the design's Hyperparameters section.\n\n"
-        "### model.py shape (rigid)\n"
-        "```python\n"
-        "from sklearn.<your_module> import <YourClass>\n"
-        "\n"
-        "def build_model():\n"
-        "    return <YourClass>(\n"
-        "        <hp_1>=<value_1>,\n"
-        "        <hp_2>=<value_2>,\n"
-        "        random_state=42,\n"
-        "    )\n"
-        "```\n"
-        "Allowed sklearn classes: MLPClassifier, LogisticRegression, "
-        "RandomForestClassifier, GradientBoostingClassifier, SVC, "
-        "KNeighborsClassifier, DecisionTreeClassifier.\n\n"
-        "Imports allowed in model.py: anything from `sklearn.*`. Nothing else.\n"
-        "No I/O. No top-level computation. No `if __name__ == '__main__'`.\n\n"
-        "### Code quality (smoke harness will reject violations)\n"
-        "- Every f-string must be properly terminated.\n"
-        "- Every `(`, `[`, `{` must have a matching closer.\n"
-        "- The code MUST `python -m py_compile` cleanly and `import` cleanly.\n"
-        "- `build_model()` MUST be callable with zero args and return an estimator.\n"
-        "- The hyperparameter values in model.py MUST match design.md exactly."
-    )
-
-    effective_target = max(
-        spec.success_threshold, oracle["test_accuracy"] + 0.05,
-    )
-    user_lines = [
-        f"## Inputs",
-        f"- **Modality:** `{profile.modality.value}`",
-        f"- **Task type:** `{profile.task_type.value}`",
-        f"- **Target column (tabular only):** `{profile.target_column}`",
-        f"- **Prepared data dir:** `{prepared_path}`",
-        f"- **Samples:** {profile.n_rows:,} "
-        + (f"(classes: {profile.n_classes})" if profile.n_classes else ""),
-        f"- **Wall-clock cap:** {envelope.max_train_minutes * 60:.0f}s",
-        "",
-        f"## Targets",
-        f"- **Hard target:** `{spec.success_metric}` ≥ {spec.success_threshold:.3f}",
-        f"- **Oracle baseline (sklearn LogReg):** test_accuracy = "
-        f"{oracle['test_accuracy']:.3f} (measured in "
-        f"{oracle.get('wall_clock_s', 0.0):.1f}s on "
-        f"n_train={oracle.get('n_train', '?')} / n_test={oracle.get('n_test', '?')}).",
-        f"- **Effective target** (max of hard target and oracle+0.05): "
-        f"≥ {effective_target:.3f}.",
-        "",
-        "## Researcher's committed architecture (already picked by human at HITL)",
-    ]
-    if arch is not None:
-        user_lines.append(f"- **Name:** `{arch.name}`")
-        user_lines.append(f"- **Family:** `{arch.family}`")
-        user_lines.append(f"- **Library:** `{arch.library}`")
-        user_lines.append(f"- **Rationale (from Researcher):** {arch.rationale}")
-        user_lines.append(f"- **Hyperparameter space:** `{arch.hyperparameter_space}`")
-        user_lines.append("")
-        user_lines.append(
-            "→ Pick ONE concrete value per hyperparameter. "
-            "Use these as your starting point; you may add `random_state=42` "
-            "and override any value the search space gave as a range."
-        )
-    user_lines.append("")
-    if previous_errors:
-        user_lines.append("## PREVIOUS ATTEMPT FAILED THE SMOKE HARNESS")
-        user_lines.append("Fix these specific errors in this attempt:")
-        for err in previous_errors:
-            user_lines.append(f"- {err}")
-        user_lines.append("")
-        user_lines.append(
-            "Carefully re-check every f-string, every bracket, every quote. "
-            "Make sure the code passes `python -m py_compile`. The design.md "
-            "structure stays the same — only the model.py needs fixing if the "
-            "error was syntactic."
-        )
-        user_lines.append("")
-    user_lines.append(
-        "Produce the structured JSON now: design.md (all 7 sections, "
-        "concrete values, rationales on every hyperparameter line) + model.py "
-        "(rigid shape from system prompt, values matching design.md exactly). "
-        "Do NOT generate train.py."
-    )
-    user = "\n".join(user_lines)
-
-    result = llm.think_and_answer_structured(
-        system=system,
-        user=user,
-        schema=_DesignAndCode,
-        on_thinking=on_thinking,
-        max_tokens=12000,
-        temperature=0.2,
-        no_think=no_think,
-    )
-    return {
-        "design_md": result.design_md,
-        "model.py": result.model_py,
-    }
-
-
-# Kept for back-compat in case anyone imports it directly; not called by the
-# new TrainerAgent.
-def generate_design_markdown(
-    llm: NemotronClient,
-    spec: StrategySpec,
-    profile: DatasetProfile,
-    envelope: TrainingEnvelope,
-    oracle: dict[str, Any],
-    on_thinking=None,
+    previous_feedback: dict[str, Any] | None = None,
 ) -> str:
-    """One Nemotron call → design.md markdown. Returns the text."""
-    system = (
-        "You are the Trainer agent. The Researcher proposed candidate "
-        "architectures; the Profiler observed the dataset; the user supplied "
-        "an objective. Your job RIGHT NOW is to commit to a specific design "
-        "and document it as Markdown for human review.\n\n"
-        "Output a single `design.md` document. Required sections:\n"
-        "  ## Architecture            — concrete model class + layer sizes\n"
-        "  ## Hyperparameters         — bullet list of the EXACT values\n"
-        "  ## Training recipe         — optimizer, batch size, max epochs\n"
-        "  ## Estimated wall-clock    — a real estimate in seconds\n"
-        "  ## Success criteria        — hard threshold + oracle sanity check\n"
-        "  ## Risks                   — what could go wrong\n\n"
-        "Constraints:\n"
-        "- Use sklearn ONLY (no PyTorch/TF). Acceptable classes: "
-        "  MLPClassifier, LogisticRegression, RandomForestClassifier, SVC, "
-        "  KNeighborsClassifier, GradientBoostingClassifier.\n"
-        "- Param count MUST stay under `recommended_max_params` from the envelope.\n"
-        "- Wall-clock estimate MUST be under `max_train_minutes * 60` seconds.\n"
-        "- The model must plausibly beat the oracle baseline by ≥5 points.\n"
-        "- Output the Markdown only — no JSON wrapper, no preamble, no code fence."
-    )
-
-    arch = spec.candidate_architectures[0] if spec.candidate_architectures else None
-    user_lines = [
-        f"## Objective\n{spec.objective}",
-        f"\n## Dataset\n- modality: `{profile.modality.value}`",
-        f"- task: `{profile.task_type.value}`",
-        f"- samples: {profile.n_rows:,}",
-    ]
-    if profile.modality == Modality.TABULAR:
-        user_lines.append(f"- columns: {profile.n_cols}")
-        user_lines.append(f"- target: `{profile.target_column}`")
-    else:
-        user_lines.append(f"- classes: {profile.n_classes}")
-        user_lines.append(f"- image_resolution: {profile.image_resolutions[:1]}")
-        user_lines.append(f"- channels: {profile.image_channels}")
-    if profile.class_balance:
-        user_lines.append(f"- class balance: {profile.class_balance}")
-    user_lines.extend([
-        f"\n## Hardware envelope",
-        f"- gpu: {envelope.gpu_name or 'CPU only'}",
-        f"- max trials: {envelope.max_trials}",
-        f"- max minutes: {envelope.max_train_minutes}",
-        f"\n## Researcher's top candidate",
-    ])
-    if arch is not None:
-        user_lines.append(
-            f"- `{arch.name}` ({arch.family} / `{arch.library}`)"
+    """LLM call 1 → design.md (Markdown). Fires before the HITL gate."""
+    is_regression = _is_regression_task(profile)
+    if is_regression:
+        task_block = (
+            "TASK TYPE: regression. Pick from sklearn regressors: "
+            "LinearRegression, Ridge, Lasso, MLPRegressor, "
+            "RandomForestRegressor, GradientBoostingRegressor, SVR, "
+            "KNeighborsRegressor, DecisionTreeRegressor.\n"
+            "- DO NOT use classifier classes. DO NOT use class_weight (regressors "
+            "don't take it). DO NOT pick LightGBM/XGBoost/PyTorch.\n"
+            "- For gradient boosting use `GradientBoostingRegressor`. For "
+            "fast non-linear use `RandomForestRegressor`. For a strong "
+            "linear baseline use `Ridge`."
         )
-        user_lines.append(f"- rationale: {arch.rationale}")
-        user_lines.append(f"- hyperparameter space: `{arch.hyperparameter_space}`")
-    user_lines.extend([
-        f"\n## Oracle baseline",
-        f"- model: `{oracle['model']}`",
-        f"- test_accuracy: {oracle['test_accuracy']:.3f}",
-        f"- wall_clock_s: {oracle['wall_clock_s']:.1f}",
-        f"\n## Success criteria",
-        f"- hard: `{spec.success_metric}` ≥ {spec.success_threshold:.3f}",
-        f"- oracle sanity: must beat baseline by ≥0.05",
-        f"\nNow write `design.md`.",
-    ])
-    user_msg = "\n".join(user_lines)
-
+    else:
+        task_block = (
+            "TASK TYPE: classification. Pick from sklearn classifiers: "
+            "MLPClassifier, LogisticRegression, RandomForestClassifier, "
+            "GradientBoostingClassifier, SVC, KNeighborsClassifier, "
+            "DecisionTreeClassifier.\n"
+            "- DO NOT use regressor classes. DO NOT pick LightGBM/XGBoost/PyTorch.\n"
+            "- **For binary classification: ALWAYS include "
+            "`class_weight='balanced'`** as a hyperparameter (supported by "
+            "LogisticRegression, SVC, RandomForestClassifier, "
+            "DecisionTreeClassifier). Imbalanced datasets without class_weight "
+            "collapse to predicting the majority class."
+        )
+    system = (
+        "You are the Trainer. Write design.md for an sklearn model on a "
+        "tabular CSV dataset. Output PLAIN MARKDOWN PROSE — not JSON, not code.\n\n"
+        "Required sections (level-2 headers, in order, using these EXACT lines):\n"
+        "  ## Architecture commitment\n"
+        "  ## Hyperparameters (final)\n"
+        "  ## Wall-clock budget\n"
+        "  ## Success criteria\n"
+        "  ## Risks & anti-patterns\n"
+        "  ## Code structure\n"
+        "  ## Verification plan\n\n"
+        "Constraints:\n"
+        f"- {task_block}\n"
+        "- Hyperparameters: one bullet per HP with EXACT concrete value + "
+        "one-line rationale. NO ranges, no `tbd`, no `~`.\n"
+        "- Total length ~150-300 words.\n"
+        "- DO NOT write JSON. DO NOT include code blocks for the architecture.\n"
+        "- Architecture commitment names the concrete sklearn class.\n"
+        "- Code structure section just says model.py exports `build_model()` "
+        "and AutoForge handles train.py."
+    )
+    user = _build_design_user_prompt(
+        spec=spec, profile=profile, envelope=envelope,
+        oracle=oracle, prep=prep, prep_config=prep_config,
+    )
+    if previous_feedback:
+        fail_mode = previous_feedback.get("failure_mode") or "unknown"
+        gap = previous_feedback.get("accuracy_gap")
+        suggestions = previous_feedback.get("suggestions") or []
+        feedback_block = [
+            "",
+            "## PREVIOUS ATTEMPT FEEDBACK (Evaluator says try a different design)",
+            f"- failure_mode: `{fail_mode}`",
+        ]
+        if gap is not None:
+            feedback_block.append(f"- accuracy_gap from target: {gap}")
+        if suggestions:
+            feedback_block.append("- suggestions:")
+            for s in suggestions:
+                feedback_block.append(f"  - {s}")
+        feedback_block.append(
+            "\nAct on this feedback: pick a stronger model, increase capacity, "
+            "or change hyperparameters to address the failure mode. DO NOT "
+            "emit the same architecture + hyperparameters as before."
+        )
+        user = user + "\n" + "\n".join(feedback_block)
     md = llm.think_and_answer(
         system=system,
-        user=user_msg,
+        user=user,
         on_thinking=on_thinking,
-        max_tokens=4000,
+        max_tokens=2000,
         temperature=0.3,
+        no_think=True,
     )
-    # If the model wrapped in a fence, strip it
+    # Strip code fences if the LLM wrapped its output
     md = md.strip()
     if md.startswith("```"):
         md = md.split("\n", 1)[1] if "\n" in md else md
@@ -443,86 +265,243 @@ def generate_design_markdown(
     return md
 
 
-# ===========================================================================
-# Stage 3: Generate code
-# ===========================================================================
-class _GeneratedCode(BaseModel):
-    """Structured output from the codegen LLM call."""
+_SKLEARN_CLASS_MAP: dict[str, str] = {
+    # Classifiers (binary / multiclass)
+    "MLPClassifier":               "sklearn.neural_network",
+    "LogisticRegression":          "sklearn.linear_model",
+    "RandomForestClassifier":      "sklearn.ensemble",
+    "GradientBoostingClassifier":  "sklearn.ensemble",
+    "SVC":                         "sklearn.svm",
+    "KNeighborsClassifier":        "sklearn.neighbors",
+    "DecisionTreeClassifier":      "sklearn.tree",
+    # Regressors
+    "LinearRegression":            "sklearn.linear_model",
+    "Ridge":                       "sklearn.linear_model",
+    "Lasso":                       "sklearn.linear_model",
+    "MLPRegressor":                "sklearn.neural_network",
+    "RandomForestRegressor":       "sklearn.ensemble",
+    "GradientBoostingRegressor":   "sklearn.ensemble",
+    "SVR":                         "sklearn.svm",
+    "KNeighborsRegressor":         "sklearn.neighbors",
+    "DecisionTreeRegressor":       "sklearn.tree",
+}
+
+_CLASSIFIER_NAMES = frozenset({
+    "MLPClassifier", "LogisticRegression", "RandomForestClassifier",
+    "GradientBoostingClassifier", "SVC", "KNeighborsClassifier",
+    "DecisionTreeClassifier",
+})
+
+_REGRESSOR_NAMES = frozenset({
+    "LinearRegression", "Ridge", "Lasso", "MLPRegressor",
+    "RandomForestRegressor", "GradientBoostingRegressor", "SVR",
+    "KNeighborsRegressor", "DecisionTreeRegressor",
+})
+
+
+def _is_regression_task(profile: DatasetProfile | None) -> bool:
+    if profile is None:
+        return False
+    return profile.task_type.value == "regression"
+
+
+class _ModelChoice(BaseModel):
+    """LLM picks ONE sklearn class + its concrete hyperparameter dict."""
     model_config = ConfigDict(extra="forbid")
-    model_py: str = Field(
-        description="Contents of model.py. Must define `build_model()` "
-        "returning a sklearn estimator."
+    sklearn_class: str = Field(
+        description=(
+            "Exact sklearn class name. Must be one of: "
+            "MLPClassifier, LogisticRegression, RandomForestClassifier, "
+            "GradientBoostingClassifier, SVC, KNeighborsClassifier, "
+            "DecisionTreeClassifier."
+        ),
     )
-    train_py: str = Field(
-        description="Contents of train.py. Must accept `--data-dir`, "
-        "`--output-dir`, `--max-time-seconds`. Loads data, fits build_model(), "
-        "saves model with joblib to `<output-dir>/best.pkl`, prints JSON metrics "
-        "to stdout."
+    hyperparameters: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Concrete keyword arguments to pass to the class. Each value is "
+            "a literal Python primitive: int, float, str, bool, null, or a "
+            "list/tuple of those. Example for MLPClassifier: "
+            '{"hidden_layer_sizes": [128, 64], "alpha": 0.001, '
+            '"learning_rate_init": 0.001, "max_iter": 200, "random_state": 42}'
+        ),
     )
 
 
-def generate_code_files(
+def _hp_value_to_literal(value: Any) -> str:
+    """Render a hyperparameter value as a Python literal for the source.
+
+    Lists with all-numeric entries are emitted as tuples (sklearn uses
+    tuples for `hidden_layer_sizes` etc.). None → None. Strings get repr().
+    """
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return "(" + ", ".join(_hp_value_to_literal(v) for v in value) + (
+            "," if len(value) == 1 else ""
+        ) + ")"
+    return repr(value)
+
+
+# If the LLM picks a non-sklearn gradient-boosting class, coerce to
+# sklearn's GradientBoostingClassifier. Keeps the pipeline alive.
+_FALLBACK_CLASS_FOR_NON_SKLEARN: dict[str, str] = {
+    # Classification → GradientBoostingClassifier
+    "XGBClassifier":       "GradientBoostingClassifier",
+    "XGBoostClassifier":   "GradientBoostingClassifier",
+    "LGBMClassifier":      "GradientBoostingClassifier",
+    "LightGBMClassifier":  "GradientBoostingClassifier",
+    "CatBoostClassifier":  "GradientBoostingClassifier",
+    # Regression → GradientBoostingRegressor
+    "XGBRegressor":        "GradientBoostingRegressor",
+    "XGBoostRegressor":    "GradientBoostingRegressor",
+    "LGBMRegressor":       "GradientBoostingRegressor",
+    "LightGBMRegressor":   "GradientBoostingRegressor",
+    "CatBoostRegressor":   "GradientBoostingRegressor",
+}
+
+
+def _synthesize_model_py(choice: _ModelChoice) -> str:
+    """Generate model.py source from the LLM's structured choice.
+
+    AutoForge owns the file shape — the LLM only contributes the class
+    name + hyperparameter dict. This makes the output reliable regardless
+    of the LLM's prior about what "model.py" should look like.
+
+    Defense in depth: non-sklearn class names (XGBoost / LightGBM / CatBoost)
+    are coerced to sklearn's `GradientBoostingClassifier`. Hyperparameters
+    are filtered to ones the target class actually accepts.
+    """
+    import importlib
+    import inspect
+
+    cls = choice.sklearn_class
+    if cls not in _SKLEARN_CLASS_MAP and cls in _FALLBACK_CLASS_FOR_NON_SKLEARN:
+        cls = _FALLBACK_CLASS_FOR_NON_SKLEARN[cls]
+    module = _SKLEARN_CLASS_MAP.get(cls)
+    if module is None:
+        raise ValueError(
+            f"LLM picked unsupported class `{choice.sklearn_class}`. "
+            f"Allowed sklearn classes: {sorted(_SKLEARN_CLASS_MAP.keys())!r}"
+        )
+
+    # Filter HPs to ones the actual class accepts. Drops xgboost-only
+    # parameters like `gamma` that would crash sklearn.
+    cls_obj = getattr(importlib.import_module(module), cls)
+    try:
+        accepted = set(inspect.signature(cls_obj).parameters.keys())
+    except (TypeError, ValueError):
+        accepted = set()
+    raw_hp = dict(choice.hyperparameters or {})
+    hp: dict[str, Any] = {}
+    dropped: list[str] = []
+    for k, v in raw_hp.items():
+        if not accepted or k in accepted:
+            hp[k] = v
+        else:
+            dropped.append(k)
+    if "random_state" not in hp and (not accepted or "random_state" in accepted):
+        hp["random_state"] = 42
+
+    lines = [
+        f"from {module} import {cls}",
+        "",
+        "",
+        "def build_model():",
+        f"    return {cls}(",
+    ]
+    for k, v in hp.items():
+        lines.append(f"        {k}={_hp_value_to_literal(v)},")
+    lines.append("    )")
+    lines.append("")
+    if dropped or cls != choice.sklearn_class:
+        notes = []
+        if cls != choice.sklearn_class:
+            notes.append(
+                f"coerced `{choice.sklearn_class}` → `{cls}` (sklearn-only)"
+            )
+        if dropped:
+            notes.append(f"dropped non-{cls} kwargs: {sorted(dropped)!r}")
+        lines.insert(0, "# AutoForge note: " + "; ".join(notes))
+    return "\n".join(lines)
+
+
+def generate_model_py(
     llm: NemotronClient,
     design_md: str,
+    spec: StrategySpec,
     profile: DatasetProfile,
-    prep: PreparationReport | None,
     on_thinking=None,
-) -> dict[str, str]:
-    """One Nemotron call → dict of filename → code. Strict JSON output."""
+) -> str:
+    """LLM call 2 → model.py source code. AutoForge synthesizes the source
+    from the LLM's structured (sklearn_class, hyperparameters) choice."""
+    is_regression = _is_regression_task(profile)
+    if is_regression:
+        class_block = (
+            "REGRESSION task: pick from LinearRegression, Ridge, Lasso, "
+            "MLPRegressor, RandomForestRegressor, GradientBoostingRegressor, "
+            "SVR, KNeighborsRegressor, DecisionTreeRegressor."
+        )
+    else:
+        class_block = (
+            "CLASSIFICATION task: pick from MLPClassifier, LogisticRegression, "
+            "RandomForestClassifier, GradientBoostingClassifier, SVC, "
+            "KNeighborsClassifier, DecisionTreeClassifier."
+        )
     system = (
-        "You generate sklearn Python code for the AutoForge Trainer.\n\n"
-        "You will produce two files: `model.py` and `train.py`.\n\n"
-        "## model.py contract\n"
-        "Defines exactly one function: `build_model()`. Returns an unfitted "
-        "sklearn estimator instance. Implements the architecture described "
-        "in the design.md provided.\n\n"
-        "## train.py contract\n"
-        "Command-line program with argparse arguments:\n"
-        "  --data-dir          path to prepared dataset (image: dir with train/+test/, csv: dir with train.csv+test.csv)\n"
-        "  --output-dir        where to save best.pkl and metrics.json\n"
-        "  --max-time-seconds  wall-clock budget (default 120). Self-terminate before exceeding.\n\n"
-        "It MUST:\n"
-        "  - Import build_model from model.py (same directory).\n"
-        "  - Load training data from --data-dir using helpers defined IN train.py.\n"
-        "  - For images: load PNGs as grayscale, flatten, normalize to [0,1].\n"
-        "  - For tabular: read CSV with pandas, separate features from target.\n"
-        "  - Call `model = build_model()` then `model.fit(X_train, y_train)`.\n"
-        "  - Save the trained model to `<output-dir>/best.pkl` via `joblib.dump`.\n"
-        "  - Compute validation accuracy on the test set.\n"
-        "  - Print a single line of JSON to stdout: "
-        "`{\"val_accuracy\": <float>, \"train_seconds\": <float>}`.\n"
-        "  - Also write that JSON dict to `<output-dir>/metrics.json`.\n\n"
-        "Imports allowed: argparse, json, time, pathlib, sys, numpy, sklearn.*, "
-        "joblib, pandas, PIL.Image.\n\n"
-        "Output a JSON object with keys `model_py` and `train_py`. The values "
-        "are the Python source code as strings. No markdown fences inside the "
-        "values — pure Python code only."
+        "You pick the sklearn estimator class and its hyperparameters for "
+        "model.py. You do NOT write Python code — you emit a tiny JSON "
+        "object that AutoForge then formats into model.py source.\n\n"
+        "Required output schema:\n"
+        '  {"sklearn_class": "<class name>", "hyperparameters": {...}}\n\n'
+        "Rules:\n"
+        f"- {class_block}\n"
+        "- DO NOT pick LightGBM, XGBoost, CatBoost, or any non-sklearn class. "
+        "If gradient boosting is in the design, use the sklearn equivalent "
+        "(GradientBoostingClassifier or GradientBoostingRegressor).\n"
+        "- `hyperparameters` is a flat JSON object. Keys are sklearn constructor "
+        "argument names. Values are literal numbers, strings, booleans, null, "
+        "or lists/tuples of those.\n"
+        "- Values MUST match the approved design.md exactly. If design.md says "
+        "`alpha = 1e-3` you write `\"alpha\": 0.001`.\n"
+        "- Include `random_state` only if you want a specific value; AutoForge "
+        "defaults it to 42 when omitted."
     )
-
     user = (
-        "## design.md (the approved design you must implement)\n\n"
-        f"{design_md}\n\n"
-        f"## Modality: `{profile.modality.value}`\n"
-        f"## Target column (CSV only): `{profile.target_column}`\n\n"
-        f"Generate the two Python files now."
+        "## Approved design.md (use these hyperparameters EXACTLY):\n\n"
+        + design_md
+        + "\n\n"
+        "Now emit the JSON object with `sklearn_class` and `hyperparameters`. "
+        "No prose, no explanation — just the JSON."
     )
-
-    result: _GeneratedCode = llm.think_and_answer_structured(
+    choice: _ModelChoice = llm.think_and_answer_structured(
         system=system,
         user=user,
-        schema=_GeneratedCode,
+        schema=_ModelChoice,
         on_thinking=on_thinking,
-        max_tokens=12000,
-        temperature=0.2,
+        max_tokens=1500,
+        temperature=0.1,
+        no_think=True,
     )
-    return {
-        "model.py": result.model_py,
-        "train.py": result.train_py,
-    }
+    return _synthesize_model_py(choice)
 
 
-# ===========================================================================
-# Stage 4: Smoke harness
+# (legacy combined function removed — Trainer now calls generate_design_md
+# and generate_model_py separately so the HITL gate fires between them.)
+def _legacy_generate_design_and_code(*_args, **_kwargs):  # noqa: ARG001
+    raise NotImplementedError(
+        "generate_design_and_code was split into generate_design_md + "
+        "generate_model_py — call those instead."
+    )
+
+
+# Stage 3: Smoke harness
 # ===========================================================================
 def run_smoke_harness(code_dir: Path) -> dict[str, Any]:
     """Verify generated code is at least syntactically + structurally sane.
@@ -552,6 +531,46 @@ def run_smoke_harness(code_dir: Path) -> dict[str, Any]:
         else:
             add(f"syntax_{filename}", True)
 
+    # Check 1b: model.py must be sklearn-only. Fail fast on torch/tensorflow
+    # imports so the retry gets a clear, actionable error message.
+    model_py = code_dir / "model.py"
+    if model_py.exists():
+        model_src = model_py.read_text(encoding="utf-8")
+        forbidden = [
+            ("import torch", "torch"),
+            ("from torch", "torch"),
+            ("import tensorflow", "tensorflow"),
+            ("from tensorflow", "tensorflow"),
+            ("import keras", "keras"),
+            ("from keras", "keras"),
+            ("import jax", "jax"),
+            ("from jax", "jax"),
+            ("import lightgbm", "lightgbm"),
+            ("from lightgbm", "lightgbm"),
+            ("import xgboost", "xgboost"),
+            ("from xgboost", "xgboost"),
+            ("import catboost", "catboost"),
+            ("from catboost", "catboost"),
+        ]
+        hits = [name for token, name in forbidden if token in model_src]
+        if hits:
+            add(
+                "sklearn_only", False,
+                f"ERROR: model.py imports {sorted(set(hits))!r} — AutoForge "
+                f"is sklearn-only. Use sklearn.neural_network.MLPClassifier, "
+                f"sklearn.linear_model.LogisticRegression, "
+                f"sklearn.ensemble.RandomForestClassifier, or another "
+                f"sklearn estimator from sklearn.*.",
+            )
+        elif not model_src.strip():
+            add(
+                "sklearn_only", False,
+                "ERROR: model.py is empty — the LLM returned no code. "
+                "(Likely a streaming hiccup or stripped fence. Re-run.)",
+            )
+        else:
+            add("sklearn_only", True)
+
     # If syntax failed, don't bother trying to import
     syntax_ok = all(c["passed"] for c in checks if c["name"].startswith("syntax_"))
     if not syntax_ok:
@@ -578,6 +597,64 @@ def run_smoke_harness(code_dir: Path) -> dict[str, Any]:
     else:
         add("import_build_model", True, import_result.stdout.strip())
 
+    # Check 3: train.py --help. Runs train.py's imports + argparse setup
+    # without doing any real training. Catches "ImportError: torch", missing
+    # required argparse args, NameError at module scope, etc.
+    train_help = subprocess.run(
+        [sys.executable, str(code_dir / "train.py"), "--help"],
+        capture_output=True, text=True, timeout=30, cwd=str(code_dir),
+    )
+    if train_help.returncode != 0:
+        err = train_help.stderr.strip()[:500] or train_help.stdout.strip()[:500]
+        add("train_py_help", False, f"ERROR: train.py --help failed: {err}")
+    else:
+        # Verify the three required flags actually appear in usage
+        usage = train_help.stdout
+        missing = [
+            f for f in ("--data-dir", "--output-dir", "--max-time-seconds")
+            if f not in usage
+        ]
+        if missing:
+            add(
+                "train_py_help", False,
+                f"ERROR: train.py --help missing required flags: {missing}",
+            )
+        else:
+            add("train_py_help", True, "argparse contract OK")
+
+    # Check 4: design.md is real Markdown with ≥5 level-2 headers, not a
+    # JSON dump of the input prompt context. We don't require exact header
+    # text (the LLM uses semantic variants — "Model Selection" instead of
+    # "Architecture commitment" etc.) — just sanity-check structure.
+    design_path = code_dir / "design.md"
+    if design_path.exists():
+        design_text = design_path.read_text(encoding="utf-8").strip()
+        starts_like_json = design_text.startswith("{") or design_text.startswith("[")
+        h2_headers = [
+            ln for ln in design_text.splitlines()
+            if ln.lstrip().startswith("## ")
+        ]
+        if starts_like_json:
+            add(
+                "design_md_format", False,
+                "ERROR: design.md starts with a JSON brace — must be plain "
+                "Markdown prose. Re-read the system prompt's required "
+                "section structure and write English text, not JSON.",
+            )
+        elif len(h2_headers) < 5:
+            add(
+                "design_md_format", False,
+                f"ERROR: design.md has only {len(h2_headers)} level-2 "
+                f"headers — must have at least 5 sections covering "
+                f"architecture, hyperparameters, budget, success criteria, "
+                f"and risks.",
+            )
+        else:
+            add(
+                "design_md_format", True,
+                f"Markdown structure OK ({len(h2_headers)} sections)",
+            )
+
     overall = all(c["passed"] for c in checks)
     return {
         "overall_passed": overall,
@@ -587,7 +664,7 @@ def run_smoke_harness(code_dir: Path) -> dict[str, Any]:
 
 
 # ===========================================================================
-# Stage 5: Subprocess training
+# Stage 4: Subprocess training
 # ===========================================================================
 def run_training_subprocess(
     code_dir: Path,

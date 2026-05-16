@@ -20,7 +20,7 @@ from contracts.messages import ApprovalRequest, ApprovalResponse
 from memory.store import MemoryStore
 
 from hitl.approval_queue import ApprovalQueue
-from hitl.telegram_bot import TelegramApprovalBot
+from hitl.slack_bot import SlackApprovalBot
 
 
 class HITLCoordinatorService:
@@ -34,11 +34,11 @@ class HITLCoordinatorService:
         self,
         store: MemoryStore,
         queue: ApprovalQueue,
-        telegram: TelegramApprovalBot | None = None,
+        slack: SlackApprovalBot | None = None,
     ) -> None:
         self.store = store
         self.queue = queue
-        self.telegram = telegram
+        self.slack = slack
 
     def request_and_wait(
         self,
@@ -50,11 +50,11 @@ class HITLCoordinatorService:
         Raises `TimeoutError` if no decision lands within `timeout` seconds.
         """
         self.queue.request_approval(request)
-        if self.telegram is not None:
+        if self.slack is not None:
             try:
-                self.telegram.send_approval_request(request)
+                self.slack.send_approval_request(request)
             except Exception:  # noqa: BLE001 — never let a bot hiccup kill a run
-                logger.exception("Telegram send failed (continuing dashboard-only)")
+                logger.exception("Slack send failed (continuing dashboard-only)")
 
         response = self.queue.wait_for_approval(request.request_id, timeout=timeout)
         if response is None:
@@ -72,34 +72,42 @@ class HITLCoordinatorService:
         """Push a notification to Telegram if configured. Dashboard sees it via
         the event stream — no extra surface needed.
         """
-        if self.telegram is not None:
+        if self.slack is not None:
             try:
-                self.telegram.notify(run_id, message, payload)
+                self.slack.notify(run_id, message, payload)
             except Exception:  # noqa: BLE001
-                logger.exception("Telegram notify failed")
+                logger.exception("Slack notify failed")
 
 
 def build_hitl_service(store: MemoryStore) -> HITLCoordinatorService:
     """Convenience factory.
 
-    - If `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` are both set, the Telegram
-      bot is started and wired in.
+    - If `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID` are both set, the Slack
+      bot is started and wired in. Per-agent channels (from
+      `slack_channel_map()`) are also passed in for routing.
     - Otherwise, the service runs dashboard-only.
     """
-    from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    from config import SLACK_BOT_TOKEN, SLACK_CHANNEL_ID, slack_channel_map
 
     queue = ApprovalQueue(store)
-    telegram: TelegramApprovalBot | None = None
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        telegram = TelegramApprovalBot(
-            token=TELEGRAM_BOT_TOKEN,
-            chat_id=TELEGRAM_CHAT_ID,
+    slack: SlackApprovalBot | None = None
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+        channel_map = slack_channel_map()
+        slack = SlackApprovalBot(
+            token=SLACK_BOT_TOKEN,
+            channel=SLACK_CHANNEL_ID,
             queue=queue,
+            channel_map=channel_map,
         )
-        telegram.start()
+        slack.start()
+        if channel_map:
+            logger.info(
+                "Slack bot wired with {} per-agent channels: {}",
+                len(channel_map), list(channel_map.keys()),
+            )
     else:
         logger.warning(
-            "Telegram secrets not configured — HITL service is dashboard-only"
+            "Slack secrets not configured — HITL service is dashboard-only"
         )
 
-    return HITLCoordinatorService(store=store, queue=queue, telegram=telegram)
+    return HITLCoordinatorService(store=store, queue=queue, slack=slack)

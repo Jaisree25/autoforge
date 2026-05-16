@@ -19,15 +19,16 @@ This keeps the LLM's structured-output surface tiny → reliable.
 """
 from __future__ import annotations
 
-import time
+import shutil
+import subprocess
 from pathlib import Path
 from typing import ClassVar
 
 import pandas as pd
-from PIL import Image
+import psutil
 from pydantic import BaseModel, ConfigDict, Field
 
-from config import STUB_AGENT_SLEEP, WORKER_MODEL
+from config import WORKER_MODEL
 from contracts.messages import EventType
 from contracts.schemas import (
     AgentName,
@@ -42,27 +43,16 @@ from agents._llm_client import NemotronClient
 from agents.base_agent import BaseAgent
 
 
-_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff"}
-
-
 # ---------------------------------------------------------------------------
-# Small private schemas for the LLM judgment calls.
-# Kept flat (no nested models) so OpenAI's strict json_schema mode accepts them.
+# Small private schemas for the LLM judgment call.
+# Kept flat (no nested models) so OpenAI's strict json_schema mode accepts it.
 # ---------------------------------------------------------------------------
-class _Judgment(BaseModel):
+class _CsvJudgment(BaseModel):
     model_config = ConfigDict(extra="forbid")
     task_type: TaskType
     warnings: list[str] = Field(default_factory=list)
     summary: str
-
-
-class _CsvJudgment(_Judgment):
     target_column: str | None = None
-
-
-class _ImageJudgment(_Judgment):
-    recommended_input_height: int | None = None
-    recommended_input_width: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -85,22 +75,6 @@ class ProfilerAgent(BaseAgent):
         "than to guess wrong."
     )
 
-    IMAGE_SYSTEM_PROMPT = (
-        "You are the Profiler, the first agent in the AutoForge pipeline. "
-        "You observe an image dataset and the user's objective, then hand "
-        "off your observations to the Researcher.\n\n"
-        "Your job is to infer:\n"
-        "  - task_type: typically image_classification when classes are "
-        "    folders\n"
-        "  - recommended_input_height/width: the input resolution the "
-        "    Trainer should feed to its model (typical CNN inputs are "
-        "    224x224 or 256x256; ViT-Base wants 224x224)\n"
-        "  - warnings: e.g. resolution variation, class imbalance, very "
-        "    small training set\n"
-        "  - summary: one short paragraph describing the dataset\n\n"
-        "Use round, standard input sizes. Don't invent unusual resolutions."
-    )
-
     def __init__(self, store, run_id: str) -> None:
         super().__init__(store=store, run_id=run_id)
         self.llm = NemotronClient(model=WORKER_MODEL)
@@ -110,23 +84,22 @@ class ProfilerAgent(BaseAgent):
     # ------------------------------------------------------------------
     def run(self, dataset_path: str, objective: str) -> DatasetProfile:  # type: ignore[override]
         path = Path(dataset_path)
-        modality = _detect_modality(path)
-        summary = f"observe {path.name} ({modality.value})"
+        summary = f"observe {path.name} (tabular)"
 
         with self._lifecycle(summary):
             self.emit_event(
                 EventType.INFO,
-                message=f"detected modality: {modality.value}",
+                message="detected modality: tabular (sklearn-only)",
                 payload={"path": str(path)},
             )
-            if modality == Modality.TABULAR:
-                return self._profile_csv(path, objective)
-            if modality == Modality.IMAGE:
-                return self._profile_images(path, objective)
-            raise ValueError(
-                f"Unsupported modality at {path}. Profiler currently handles "
-                "CSV files and directories of images."
-            )
+            # AutoForge narrowed to tabular CSV + sklearn. Image inputs
+            # used to be supported via _profile_images but were dropped
+            # when the Preparer / Trainer dropped their image paths.
+            if not path.is_file() or path.suffix.lower() not in {".csv", ".tsv"}:
+                raise ValueError(
+                    f"AutoForge supports only CSV/TSV inputs. Got: {path}"
+                )
+            return self._profile_csv(path, objective)
 
     # ------------------------------------------------------------------
     # CSV branch
@@ -223,175 +196,122 @@ class ProfilerAgent(BaseAgent):
         return profile
 
     # ------------------------------------------------------------------
-    # Image branch
-    # ------------------------------------------------------------------
-    def _profile_images(self, path: Path, objective: str) -> DatasetProfile:
-        # If a single image file was passed, treat its parent as the dataset.
-        if path.is_file() and path.suffix.lower() in _IMG_EXTS:
-            path = path.parent
-
-        self.emit_event(
-            EventType.TOOL_CALL,
-            message=f"glob images under '{path.name}/'",
-        )
-        image_paths = [p for p in path.rglob("*") if p.suffix.lower() in _IMG_EXTS]
-        n_images = len(image_paths)
-
-        if n_images == 0:
-            raise ValueError(f"No images found under {path}")
-
-        # Class structure: immediate subdirectories of `path` count as classes
-        class_dirs = [d for d in path.iterdir() if d.is_dir()]
-        class_balance: dict[str, float] | None = None
-        n_classes: int | None = None
-        if class_dirs:
-            counts: dict[str, int] = {}
-            for d in class_dirs:
-                cls_imgs = [p for p in d.rglob("*") if p.suffix.lower() in _IMG_EXTS]
-                counts[d.name] = len(cls_imgs)
-            total = sum(counts.values())
-            if total > 0:
-                class_balance = {k: v / total for k, v in counts.items()}
-                n_classes = len(counts)
-
-        # Sample images to derive resolution / format / channels
-        self.emit_event(
-            EventType.TOOL_CALL,
-            message=f"PIL.Image.open × {min(20, n_images)} samples",
-        )
-        sample = image_paths[: min(20, n_images)]
-        resolutions: list[tuple[int, int]] = []
-        formats: set[str] = set()
-        channels: int | None = None
-        for ip in sample:
-            try:
-                with Image.open(ip) as img:
-                    resolutions.append((img.size[0], img.size[1]))  # (W, H)
-                    if img.format:
-                        formats.add(img.format.lower())
-                    if channels is None:
-                        channels = len(img.getbands())
-            except Exception as exc:  # noqa: BLE001
-                self.emit_event(
-                    EventType.WARNING,
-                    message=f"could not read {ip.name}: {exc}",
-                )
-
-        # Build prompt for LLM judgment
-        res_min = (min(r[0] for r in resolutions), min(r[1] for r in resolutions)) if resolutions else None
-        res_max = (max(r[0] for r in resolutions), max(r[1] for r in resolutions)) if resolutions else None
-        class_block = (
-            "\n".join(f"  - {c}: {counts[c]} images" for c in counts)
-            if class_dirs else "  (no class subdirectories — unlabeled images)"
-        )
-        user_prompt = (
-            f"Objective: {objective}\n\n"
-            f"Dataset: {path.name} ({n_images} images)\n"
-            f"Classes ({n_classes or 0}):\n{class_block}\n\n"
-            f"Sample resolutions (W×H): {resolutions[:5]}\n"
-            f"Resolution range: {res_min} to {res_max}\n"
-            f"Image formats: {sorted(formats)}\n"
-            f"Channels per image: {channels}\n\n"
-            "Infer task type, recommended input resolution for the Trainer, "
-            "warnings (resolution variation? class imbalance? tiny dataset?), "
-            "and a one-paragraph summary."
-        )
-
-        self.emit_event(
-            EventType.TOOL_CALL,
-            message=f"nemotron.think (model={self.llm.model})",
-        )
-        judgment: _ImageJudgment = self.llm.think_and_answer_structured(
-            system=self.IMAGE_SYSTEM_PROMPT,
-            user=user_prompt,
-            schema=_ImageJudgment,
-            on_thinking=lambda p: self.emit_event(
-                EventType.THINKING, message=p,
-            ),
-        )
-
-        profile = DatasetProfile(
-            dataset_path=str(path),
-            modality=Modality.IMAGE,
-            n_rows=n_images,
-            n_cols=0,  # not applicable
-            image_resolutions=resolutions,
-            image_channels=channels,
-            image_formats=sorted(formats),
-            n_classes=n_classes,
-            task_type=judgment.task_type,
-            class_balance=class_balance,
-            warnings=judgment.warnings,
-            profile_summary=judgment.summary,
-        )
-        self.emit_event(
-            EventType.INFO,
-            message=(
-                f"image profile ready: {n_images} images, "
-                f"{n_classes or 0} class(es), "
-                f"task={judgment.task_type.value}"
-            ),
-        )
-        return profile
-
-    # ------------------------------------------------------------------
-    # Hardware envelope (still a stub — pynvml integration is a separate
-    # task; this lets Trainer have a valid envelope downstream).
+    # Hardware envelope — real probe.
+    # CPU + memory via psutil; GPU via `nvidia-smi` subprocess (best effort,
+    # gracefully reports CPU-only when the binary isn't on PATH). Trainer
+    # budget (max_trials, max_train_minutes, allowed libraries) is derived
+    # from what was actually measured.
     # ------------------------------------------------------------------
     def run_envelope(self) -> TrainingEnvelope:
         with self._lifecycle("detect hardware envelope"):
-            self.emit_event(
-                EventType.TOOL_CALL,
-                message="pynvml.nvmlDeviceGetCount() [stub: simulating L40S]",
-            )
-            time.sleep(STUB_AGENT_SLEEP)
+            cpu_count, mem_gb = self._probe_cpu_mem()
+            gpu_name, gpu_mem_gb = self._probe_gpu()
+
+            gpu_available = gpu_name is not None
+            if gpu_available:
+                max_trials = 20
+                max_train_minutes = 5.0
+                batch_size_range = (32, 256)
+                allowed_libraries = ["sklearn", "pytorch", "torchvision"]
+                mixed_precision = (gpu_mem_gb or 0.0) >= 16.0
+                notes = (
+                    f"GPU detected: {gpu_name} "
+                    f"({gpu_mem_gb:.0f}GB). "
+                    f"CPU: {cpu_count} cores · system RAM: {mem_gb:.0f}GB. "
+                    f"Allowing 20 trials over ≤5 min."
+                )
+            else:
+                # CPU-only: shrink the envelope. sklearn is the only
+                # library we exercise without a GPU.
+                max_trials = max(4, min(8, cpu_count))
+                max_train_minutes = 2.0
+                batch_size_range = (16, 128)
+                allowed_libraries = ["sklearn"]
+                mixed_precision = False
+                notes = (
+                    f"No GPU detected — running CPU-only on "
+                    f"{cpu_count} cores ({mem_gb:.0f}GB RAM). "
+                    f"Capping trials at {max_trials} over ≤"
+                    f"{max_train_minutes:.0f} min; sklearn-only."
+                )
+
             envelope = TrainingEnvelope(
-                gpu_available=True,
-                gpu_name="NVIDIA L40S",
-                gpu_memory_gb=48.0,
-                cpu_count=16,
-                system_memory_gb=128.0,
-                max_train_minutes=5.0,
-                max_trials=20,
-                batch_size_range=(32, 256),
-                allowed_libraries=["xgboost", "sklearn", "pytorch", "torchvision"],
-                mixed_precision=False,
-                notes=(
-                    "L40S has headroom for tabular and small-image workloads. "
-                    "Capping trials at 20 for ≤5-min iteration time."
-                ),
+                gpu_available=gpu_available,
+                gpu_name=gpu_name,
+                gpu_memory_gb=gpu_mem_gb,
+                cpu_count=cpu_count,
+                system_memory_gb=mem_gb,
+                max_train_minutes=max_train_minutes,
+                max_trials=max_trials,
+                batch_size_range=batch_size_range,
+                allowed_libraries=allowed_libraries,
+                mixed_precision=mixed_precision,
+                notes=notes,
             )
             self.emit_event(
                 EventType.INFO,
                 message=(
-                    f"envelope: gpu={envelope.gpu_name}, "
+                    f"envelope: gpu={envelope.gpu_name or 'none'}, "
+                    f"cpu={envelope.cpu_count}, "
                     f"max_trials={envelope.max_trials}"
                 ),
             )
         return envelope
 
+    # ------------------------------------------------------------------
+    # Hardware probes — keep tiny + side-effect-free.
+    # ------------------------------------------------------------------
+    def _probe_cpu_mem(self) -> tuple[int, float]:
+        self.emit_event(
+            EventType.TOOL_CALL,
+            message="psutil.cpu_count() + psutil.virtual_memory()",
+        )
+        cpu_count = psutil.cpu_count(logical=True) or 1
+        mem_gb = psutil.virtual_memory().total / (1024 ** 3)
+        return cpu_count, round(mem_gb, 1)
 
-# ---------------------------------------------------------------------------
-# Modality detection
-# ---------------------------------------------------------------------------
-def _detect_modality(path: Path) -> Modality:
-    if not path.exists():
-        return Modality.UNKNOWN
+    def _probe_gpu(self) -> tuple[str | None, float | None]:
+        """Try `nvidia-smi`. Returns `(name, memory_gb)` or `(None, None)`.
 
-    if path.is_file():
-        suffix = path.suffix.lower()
-        if suffix in {".csv", ".tsv"}:
-            return Modality.TABULAR
-        if suffix in _IMG_EXTS:
-            return Modality.IMAGE
-        return Modality.UNKNOWN
+        We deliberately avoid `pynvml` so this works on machines that have
+        the NVIDIA driver but not the Python binding installed.
+        """
+        nvidia_smi = shutil.which("nvidia-smi")
+        if nvidia_smi is None:
+            self.emit_event(
+                EventType.INFO,
+                message="nvidia-smi not on PATH — assuming no GPU",
+            )
+            return None, None
 
-    if path.is_dir():
-        # Prefer images if directory contains them; else look for a CSV.
-        for p in path.rglob("*"):
-            if p.suffix.lower() in _IMG_EXTS:
-                return Modality.IMAGE
-        for p in path.glob("*.csv"):
-            return Modality.TABULAR
+        self.emit_event(
+            EventType.TOOL_CALL,
+            message="nvidia-smi --query-gpu=name,memory.total",
+        )
+        try:
+            result = subprocess.run(
+                [
+                    nvidia_smi,
+                    "--query-gpu=name,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            self.emit_event(
+                EventType.WARNING,
+                message=f"nvidia-smi failed: {type(exc).__name__}: {exc}",
+            )
+            return None, None
 
-    return Modality.UNKNOWN
+        if result.returncode != 0 or not result.stdout.strip():
+            return None, None
+
+        first = result.stdout.strip().splitlines()[0]
+        try:
+            name_part, mem_part = first.split(",", 1)
+            return name_part.strip(), round(float(mem_part.strip()) / 1024.0, 1)
+        except (ValueError, IndexError):
+            return None, None
+
+

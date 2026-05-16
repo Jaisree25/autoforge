@@ -155,6 +155,15 @@ class Coordinator(BaseAgent):
         run_id = run_id or str(uuid.uuid4())
         super().__init__(store=store, run_id=run_id)
         self.hitl = hitl
+        # If the HITL service has a Slack handle, broadcast lifecycle events
+        # from the Coordinator AND from every agent it constructs.
+        self.slack = getattr(hitl, "slack", None)
+
+    def _attach_slack(self, agent: BaseAgent) -> BaseAgent:
+        """Wire Slack into a freshly-constructed agent so its STARTED /
+        COMPLETED / ERROR events broadcast to the channel."""
+        agent.slack = self.slack
+        return agent
 
     def run(self, *args: Any, **kwargs: Any):  # pragma: no cover
         raise NotImplementedError("Use Coordinator.execute() instead")
@@ -198,17 +207,61 @@ class Coordinator(BaseAgent):
                 AgentName.DATASET, prep, _display(AgentName.TRAINING),
             )
 
-            # --- Stage 4: Trainer ---
-            training = self._run_training(spec, envelope, profile, prep)
-            self._gate(
-                AgentName.TRAINING, training, _display(AgentName.BENCHMARK),
-            )
+            # --- Stage 4+5: Trainer → Evaluator with feedback retry loop ---
+            # If Evaluator says FAIL, the human gets a "retry with feedback?"
+            # gate. Up to MAX_TRAINER_RETRIES additional attempts. The Trainer
+            # receives the Evaluator's feedback dict (failure_mode + suggestions)
+            # and picks a different design on each retry.
+            MAX_TRAINER_RETRIES = 2
+            training = None
+            benchmark = None
+            previous_feedback: dict | None = None
+            for attempt_num in range(1, MAX_TRAINER_RETRIES + 2):
+                training = self._run_training(
+                    spec, envelope, profile, prep,
+                    previous_feedback=previous_feedback,
+                    attempt_num=attempt_num,
+                )
+                self._gate(
+                    AgentName.TRAINING, training, _display(AgentName.BENCHMARK),
+                )
 
-            # --- Stage 5: Evaluator ---
-            benchmark = self._run_benchmark(training, spec, profile, prep)
-            self._gate(
-                AgentName.BENCHMARK, benchmark, _display(AgentName.HARDWARE),
-            )
+                benchmark = self._run_benchmark(training, spec, profile, prep)
+
+                # If passed, or no retries left, exit the loop.
+                if benchmark.passed_threshold or attempt_num > MAX_TRAINER_RETRIES:
+                    self._gate(
+                        AgentName.BENCHMARK, benchmark,
+                        _display(AgentName.HARDWARE),
+                    )
+                    break
+
+                # Failed with retries available — ask the human whether to
+                # retry the Trainer with the Evaluator's feedback or accept.
+                retry_approved = self._gate_retry(
+                    benchmark=benchmark,
+                    spec=spec,
+                    attempt_num=attempt_num,
+                    max_retries=MAX_TRAINER_RETRIES,
+                )
+                if not retry_approved:
+                    self._gate(
+                        AgentName.BENCHMARK, benchmark,
+                        _display(AgentName.HARDWARE),
+                    )
+                    break
+
+                # Parse the Evaluator's feedback dict for the next Trainer call.
+                fb_raw = benchmark.feedback_to_training
+                if isinstance(fb_raw, str) and fb_raw.strip():
+                    import json as _json
+                    try:
+                        previous_feedback = _json.loads(fb_raw)
+                    except Exception:  # noqa: BLE001
+                        previous_feedback = {"failure_mode": "unknown",
+                                             "suggestions": [fb_raw[:200]]}
+                else:
+                    previous_feedback = None
 
             # --- Stage 6: Optimizer (post-training only, no gate after) ---
             self._run_optimizer(training)
@@ -258,7 +311,7 @@ class Coordinator(BaseAgent):
     def _run_profiler(
         self, dataset_path: str, objective: str,
     ) -> tuple[DatasetProfile, TrainingEnvelope]:
-        agent = ProfilerAgent(self.store, self.run_id)
+        agent = self._attach_slack(ProfilerAgent(self.store, self.run_id))
         profile = agent.run(dataset_path=dataset_path, objective=objective)
         self.store.save_agent_output(
             self.run_id, AgentName.PROFILER, "dataset_profile", profile,
@@ -270,7 +323,7 @@ class Coordinator(BaseAgent):
         return profile, envelope
 
     def _run_strategy(self, objective: str, profile: DatasetProfile) -> StrategySpec:
-        agent = StrategyAgent(self.store, self.run_id)
+        agent = self._attach_slack(StrategyAgent(self.store, self.run_id))
         spec = agent.run(objective=objective, dataset_profile=profile)
         self.store.save_agent_output(
             self.run_id, AgentName.STRATEGY, "strategy_spec", spec,
@@ -280,7 +333,7 @@ class Coordinator(BaseAgent):
     def _run_preparer(
         self, profile: DatasetProfile, spec: StrategySpec,
     ) -> PreparationReport:
-        agent = DatasetAgent(self.store, self.run_id)
+        agent = self._attach_slack(DatasetAgent(self.store, self.run_id))
         prep = agent.run(dataset_profile=profile, strategy_spec=spec)
         self.store.save_agent_output(
             self.run_id, AgentName.DATASET, "preparation_report", prep,
@@ -293,16 +346,22 @@ class Coordinator(BaseAgent):
         envelope: TrainingEnvelope,
         profile: DatasetProfile,
         prep: PreparationReport,
+        previous_feedback: dict[str, Any] | None = None,
+        attempt_num: int = 1,
     ) -> TrainingResult:
         # Trainer runs its own internal HITL gate for design.md, so we hand it
         # the HITL service. The post-training "Trainer → Evaluator" gate still
         # fires from the Coordinator below.
-        agent = TrainingAgent(self.store, self.run_id, hitl=self.hitl)
+        agent = self._attach_slack(
+            TrainingAgent(self.store, self.run_id, hitl=self.hitl)
+        )
         result = agent.run(
             strategy_spec=spec,
             training_envelope=envelope,
             dataset_profile=profile,
             preparation_report=prep,
+            previous_feedback=previous_feedback,
+            attempt_num=attempt_num,
         )
         self.store.save_agent_output(
             self.run_id, AgentName.TRAINING, "training_result", result,
@@ -316,7 +375,7 @@ class Coordinator(BaseAgent):
         profile: DatasetProfile,
         prep: PreparationReport,
     ) -> BenchmarkReport:
-        agent = BenchmarkAgent(self.store, self.run_id)
+        agent = self._attach_slack(BenchmarkAgent(self.store, self.run_id))
         report = agent.run(
             training_result=training,
             strategy_spec=spec,
@@ -329,7 +388,7 @@ class Coordinator(BaseAgent):
         return report
 
     def _run_optimizer(self, training: TrainingResult) -> DeploymentArtifact:
-        agent = HardwareAgent(self.store, self.run_id)
+        agent = self._attach_slack(HardwareAgent(self.store, self.run_id))
         artifact = agent.run_post_training(training_result=training)
         self.store.save_agent_output(
             self.run_id, AgentName.HARDWARE, "deployment_artifact", artifact,
@@ -339,6 +398,85 @@ class Coordinator(BaseAgent):
     # ------------------------------------------------------------------
     # Specialized HITL gate: pick one candidate architecture
     # ------------------------------------------------------------------
+    def _gate_retry(
+        self,
+        benchmark: BenchmarkReport,
+        spec: StrategySpec,
+        attempt_num: int,
+        max_retries: int,
+    ) -> bool:
+        """HITL gate: ask the human whether to retry the Trainer with the
+        Evaluator's feedback, or accept the failed benchmark and continue.
+
+        Returns True if the human approves the retry. Rejection or any
+        non-approval lets the pipeline accept the failed result and proceed
+        to the Optimizer.
+        """
+        from_agent = AgentName.BENCHMARK
+        next_display = (
+            f"{_display(AgentName.TRAINING)} (retry {attempt_num + 1}/"
+            f"{max_retries + 1})"
+        )
+        try:
+            import json as _json
+            feedback = _json.loads(benchmark.feedback_to_training or "{}")
+        except Exception:  # noqa: BLE001
+            feedback = {}
+        summary = (
+            f"FAIL · {benchmark.accuracy_metric.upper()}="
+            f"{benchmark.accuracy_value:.3f} "
+            f"(threshold {spec.success_threshold:.3f}). "
+            f"Failure mode: `{feedback.get('failure_mode', 'unknown')}`. "
+            f"Retry the Trainer with this feedback ({attempt_num}/"
+            f"{max_retries} retries used)?"
+        )
+        request = ApprovalRequest(
+            run_id=self.run_id,
+            agent=from_agent,
+            title=f"{_display(from_agent)} → retry Trainer?",
+            description=summary,
+            payload={
+                "kind": "retry_decision",
+                "summary": summary,
+                "next_agent": next_display,
+                "attempt_num": attempt_num,
+                "max_retries": max_retries,
+                "benchmark": benchmark.model_dump(mode="json"),
+                "feedback": feedback,
+            },
+        )
+        self.store.update_run_status(self.run_id, PipelineStatus.AWAITING_APPROVAL)
+        self.emit_event(
+            EventType.APPROVAL_REQUESTED,
+            message=(
+                f"Trainer retry decision: "
+                f"{benchmark.accuracy_metric}={benchmark.accuracy_value:.3f} "
+                f"(threshold {spec.success_threshold:.3f}). "
+                f"Approve to retry, reject to accept the failed result."
+            ),
+            payload={
+                "summary": summary,
+                "next_agent": next_display,
+                "from_agent": from_agent.value,
+                "request_id": request.request_id,
+            },
+        )
+        response = self.hitl.request_and_wait(request)
+        self.emit_event(
+            EventType.APPROVAL_RECEIVED,
+            message=(
+                f"retry-decision: {response.decision.value} by "
+                f"{response.responder or 'unknown'}"
+                + (f" — {response.comment}" if response.comment else "")
+            ),
+            payload={
+                "request_id": response.request_id,
+                "decision": response.decision.value,
+            },
+        )
+        self.store.update_run_status(self.run_id, PipelineStatus.RUNNING)
+        return response.decision is ApprovalDecision.APPROVED
+
     def _gate_candidate_pick(self, spec: StrategySpec) -> StrategySpec:
         """Show the human a radio-button list of Researcher candidates.
 
@@ -460,14 +598,12 @@ class Coordinator(BaseAgent):
         from_agent: AgentName,
         output: BaseModel,
         next_agent_display: str,
-        edit_model: type[BaseModel] | None = None,
-    ) -> BaseModel | None:
+    ) -> None:
         return self._gate_custom(
             from_agent=from_agent,
             output=output,
             next_agent_display=next_agent_display,
             summary_override=None,
-            edit_model=edit_model,
         )
 
     def _gate_custom(
@@ -476,8 +612,7 @@ class Coordinator(BaseAgent):
         output: BaseModel,
         next_agent_display: str,
         summary_override: str | None = None,
-        edit_model: type[BaseModel] | None = None,
-    ) -> BaseModel | None:
+    ) -> None:
         """Block until the human approves. `summary_override` lets stages
         with multi-output handoffs (e.g. Profiler) supply a richer summary
         than `_summarize(output)` produces alone."""
@@ -526,27 +661,4 @@ class Coordinator(BaseAgent):
             )
 
         self.store.update_run_status(self.run_id, PipelineStatus.RUNNING)
-
-        if (
-            edit_model is not None
-            and response.decision is ApprovalDecision.EDITED
-            and response.response_payload is not None
-        ):
-            raw = response.response_payload.get(
-                "agent_output", response.response_payload,
-            )
-            try:
-                edited = edit_model.model_validate(raw)
-                # Only Strategy currently supports semantic edits.
-                self.store.save_agent_output(
-                    self.run_id, from_agent, "strategy_spec", edited,
-                )
-                self.emit_event(
-                    EventType.INFO,
-                    message=f"{from_display} output edited by reviewer — using edited version",
-                )
-                return edited
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to apply edit: {}", exc)
-
         return None

@@ -14,10 +14,11 @@ dependencies:
   - rich>=13.0
   - typer>=0.12
 
-  # Data + light ML (used once stubs become real)
+  # Data + light ML
   - pandas
   - numpy
   - scikit-learn
+  - psutil>=5.9   # Profiler hardware probe (CPU + memory)
 
   # Test
   - pytest>=8.0
@@ -40,13 +41,10 @@ dependencies:
       - tavily-python>=0.5
       - arxiv>=2.1
 
-      # Training stack (deepened in Phase 9+)
+      # Optional ML libs — only imported via try/except in tools/training_tools.py:select_classifier_class.
+      # Trainer is sklearn-only by default; these unlock alternate codepaths if installed.
       - xgboost>=2.0
       - optuna>=3.5
 
-      # Data profiling (Dataset Agent deepening)
-      - ydata-profiling>=4.6
-
-      # OpenClaw + Nemotron-specific clients — uncomment once install instructions land
-      # - openclaw
+      # NemoClaw — uncomment when wiring the subprocess sandbox (planned).
       # - nemoclaw

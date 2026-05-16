@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import re
+import os
 from typing import Any, Callable, TypeVar
 
 from loguru import logger
@@ -66,7 +67,14 @@ class NemotronClient:
                 "in your key from build.nvidia.com."
             )
         self.model = model or WORKER_MODEL
-        self._client = OpenAI(api_key=NVIDIA_API_KEY, base_url=NVIDIA_BASE_URL)
+        self._client = OpenAI(
+            api_key=NVIDIA_API_KEY,
+            base_url=os.getenv("NEMOCLAW_BASE_URL", NVIDIA_BASE_URL),
+            # NVIDIA NIM has occasional sub-second connection blips. Retry
+            # the request up to 5 times before bubbling up the error.
+            max_retries=5,
+            timeout=120.0,
+        )
 
     # ------------------------------------------------------------------
     # Free-form: reasoning + plain text answer
@@ -427,7 +435,30 @@ class NemotronClient:
             # Nemotron-NIM may or may not honor this; passing it is safe.
             kwargs["response_format"] = response_format
 
-        stream = self._client.chat.completions.create(**kwargs)
+        # Brev's egress occasionally drops DNS / connect for a second or two.
+        # The OpenAI SDK's max_retries doesn't always cover the connect path
+        # for streaming responses, so retry explicitly here with backoff.
+        import time as _time
+        from openai import APIConnectionError, APIError
+        last_exc: Exception | None = None
+        stream = None
+        for connect_attempt in range(5):
+            try:
+                stream = self._client.chat.completions.create(**kwargs)
+                break
+            except (APIConnectionError, APIError) as exc:
+                last_exc = exc
+                wait = min(2.0 ** connect_attempt, 8.0)
+                logger.warning(
+                    "LLM stream connect attempt {} failed ({}: {}); "
+                    "retrying in {:.1f}s",
+                    connect_attempt + 1, type(exc).__name__, exc, wait,
+                )
+                _time.sleep(wait)
+        if stream is None:
+            raise last_exc or RuntimeError(
+                "LLM stream failed after 5 connect attempts"
+            )
 
         thinking_buf = ""
         answer_parts: list[str] = []

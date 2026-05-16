@@ -11,6 +11,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import ClassVar
 
+import json
+
 import numpy as np
 
 from contracts.messages import EventType
@@ -63,16 +65,31 @@ class BenchmarkAgent(BaseAgent):
                 EventType.TOOL_CALL,
                 message="sklearn.metrics + 100× single-sample latency probe",
             )
-            metric = strategy_spec.success_metric or "accuracy"
-            ev = tt.evaluate_classifier(
-                model=model,
-                X_test=X_test,
-                y_test=y_test,
-                metric=metric,
+            is_regression = (
+                dataset_profile is not None
+                and dataset_profile.task_type.value == "regression"
             )
+            metric = strategy_spec.success_metric or (
+                "r2" if is_regression else "accuracy"
+            )
+            if is_regression:
+                ev = tt.evaluate_regressor(
+                    model=model,
+                    X_test=X_test,
+                    y_test=y_test,
+                    metric=metric,
+                )
+            else:
+                ev = tt.evaluate_classifier(
+                    model=model,
+                    X_test=X_test,
+                    y_test=y_test,
+                    metric=metric,
+                )
 
             headline = ev["headline_value"]
-            passed = headline >= strategy_spec.success_threshold
+            effective_score = headline - 0.01 * np.log1p(ev["latency_p50_ms"])
+            passed = effective_score >= strategy_spec.success_threshold
             verdict = "PASS" if passed else "FAIL"
             self.emit_event(
                 EventType.INFO,
@@ -102,13 +119,56 @@ class BenchmarkAgent(BaseAgent):
             ]
 
             # --- Feedback to Training (for a future feedback loop) ---
-            feedback: str | None = None
+            feedback = None
+            failure_mode = None
+
             if not passed:
                 gap = strategy_spec.success_threshold - headline
-                feedback = (
-                    f"Threshold missed by {gap:.3f}. Consider: more trials, "
-                    f"larger hyperparameter search space, or a different architecture."
-                )
+
+                # simple failure classification
+                max_latency = getattr(strategy_spec, "max_latency_ms", float("inf"))
+                if ev["latency_p50_ms"] > max_latency:
+                    failure_mode = "latency_bound"
+                elif headline < 0.55:
+                    failure_mode = "severe_underfit"
+                elif len(training_result.all_trials) < 3:
+                    failure_mode = "insufficient_search"
+                else:
+                    failure_mode = "marginal_underfit"
+
+                feedback = {
+                    "failure_mode": failure_mode,
+                    "accuracy_gap": float(gap),
+                    "suggestions": []
+                }
+
+                if failure_mode == "latency_bound":
+                    feedback["suggestions"] = [
+                        "reduce model complexity",
+                        "prefer linear or shallow tree models",
+                        "reduce feature dimensionality"
+                    ]
+
+                elif failure_mode == "severe_underfit":
+                    feedback["suggestions"] = [
+                        "increase model capacity (hidden layers / depth)",
+                        "reduce regularization",
+                        "switch model family"
+                    ]
+
+                elif failure_mode == "insufficient_search":
+                    feedback["suggestions"] = [
+                        "expand hyperparameter search space",
+                        "increase number of trials",
+                        "use stochastic perturbation around best config"
+                    ]
+
+                else:
+                    feedback["suggestions"] = [
+                        "fine-tune learning rate / regularization",
+                        "increase training budget slightly",
+                        "run small architecture mutation search"
+                    ]
 
             report = BenchmarkReport(
                 model_id=training_result.best_model_id,
@@ -125,12 +185,20 @@ class BenchmarkAgent(BaseAgent):
                                 # size from Optimizer is the persistent number
                 passed_threshold=passed,
                 pareto_frontier=pareto,
-                feedback_to_training=feedback,
+                feedback_to_training=(
+                    json.dumps(feedback) if isinstance(feedback, dict)
+                    else feedback
+                ),
                 notes=(
                     f"sklearn evaluation on {ev['n_test_samples']} test samples. "
-                    f"accuracy={ev['accuracy']:.3f}, f1={ev['f1']:.3f}, "
-                    f"precision={ev['precision']:.3f}, recall={ev['recall']:.3f}"
-                    + (f", auc={ev['auc']:.3f}" if ev.get('auc') is not None else "")
+                    + (
+                        f"R²={ev['accuracy']:.3f}, RMSE={ev['f1']:.3f}, "
+                        f"MAE={ev['precision']:.3f}, MSE={ev['recall']:.3f}"
+                        if is_regression else
+                        f"accuracy={ev['accuracy']:.3f}, f1={ev['f1']:.3f}, "
+                        f"precision={ev['precision']:.3f}, recall={ev['recall']:.3f}"
+                        + (f", auc={ev['auc']:.3f}" if ev.get('auc') is not None else "")
+                    )
                 ),
             )
         return report

@@ -354,14 +354,11 @@ def _trainer_view(result: TrainingResult | None, run_id: str) -> None:
     Two modes:
       1. Final mode — `TrainingResult` is persisted (after subprocess training).
          Shows the metric, trial chart, etc.
-      2. **In-progress mode** — Trainer is mid-run and paused at the design.md
-         HITL gate. No TrainingResult yet, but the per-run dir has artifacts
-         the human is actually trying to review:
-             oracle.json  — baseline accuracy from Stage 1
-             design.md    — the doc this gate is approving
-             verify_report.json — smoke harness verdict
-             code/model.py, code/train.py — what's about to run
-         Render them all so the design gate has the substance it needs.
+      2. **In-progress mode** — Trainer is mid-run. Linear flow writes all
+         artifacts into a flat `training/` directory:
+             oracle.json                      — baseline accuracy
+             training/{design.md, model.py, train.py, verify_report.json,
+                       status.json, models/, logs/}
     """
     run_dir = ARTIFACTS_DIR / run_id
 
@@ -445,21 +442,43 @@ def _render_trainer_in_progress(run_dir: Path) -> bool:
     """Render whatever Trainer artifacts are on disk. Returns True if anything
     was rendered (caller can suppress the empty-state placeholder)."""
     oracle_path = run_dir / "oracle.json"
-    design_path = run_dir / "design.md"
-    verify_path = run_dir / "verify_report.json"
-    model_py_path = run_dir / "code" / "model.py"
-    train_py_path = run_dir / "code" / "train.py"
+    training_dir = run_dir / "training"
 
-    any_found = any(p.exists() for p in (
-        oracle_path, design_path, verify_path, model_py_path, train_py_path,
-    ))
+    # Find the latest attempt-N subdir (retry loop creates attempt-1, -2, ...).
+    attempt_dirs = []
+    if training_dir.is_dir():
+        attempt_dirs = sorted(
+            (p for p in training_dir.iterdir()
+             if p.is_dir() and p.name.startswith("attempt-")),
+            key=lambda p: int(p.name.split("-", 1)[1])
+            if p.name.split("-", 1)[1].isdigit() else 0,
+        )
+    latest = attempt_dirs[-1] if attempt_dirs else training_dir
+    design_path = latest / "design.md"
+    verify_path = latest / "verify_report.json"
+    model_py_path = latest / "model.py"
+    train_py_path = latest / "train.py"
+    status_path = latest / "status.json"
+
+    any_found = oracle_path.exists() or training_dir.is_dir()
     if not any_found:
         return False
 
+    status_info = {}
+    if status_path.exists():
+        try:
+            status_info = json.loads(status_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+    status_label = status_info.get("status")
+    header = "**Trainer is mid-flight.**"
+    if status_label == "success":
+        header = "**Trainer succeeded.**"
+    elif status_label in ("smoke_failed", "training_failed"):
+        header = f"**Trainer failed:** {status_label}"
     st.markdown(
-        "**Trainer is paused at the design.md HITL gate.** "
-        "Review the artifacts below, then click ✅ Approve in the Approvals "
-        "panel to start training."
+        header + " Review artifacts below. If a design gate is open in the "
+        "Approvals panel, approve it to continue."
     )
 
     # --- Oracle baseline ---
@@ -533,22 +552,49 @@ def _render_trainer_in_progress(run_dir: Path) -> bool:
     # --- Generated code (collapsed by default) ---
     if model_py_path.exists() or train_py_path.exists():
         st.divider()
-        st.markdown("### Generated code")
+        st.markdown("### Generated code (model.py + train.py, by Nemotron)")
         if model_py_path.exists():
-            with st.expander(f"`code/model.py` ({model_py_path.stat().st_size:,} bytes)"):
+            with st.expander(
+                f"`model.py` ({model_py_path.stat().st_size:,} bytes)"
+            ):
                 try:
-                    st.code(model_py_path.read_text(encoding="utf-8"), language="python")
+                    st.code(
+                        model_py_path.read_text(encoding="utf-8"),
+                        language="python",
+                    )
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Could not read model.py: {exc}")
         if train_py_path.exists():
             with st.expander(
-                f"`code/train.py` ({train_py_path.stat().st_size:,} bytes) "
-                "— AutoForge-templated runner"
+                f"`train.py` ({train_py_path.stat().st_size:,} bytes)"
             ):
                 try:
-                    st.code(train_py_path.read_text(encoding="utf-8"), language="python")
+                    st.code(
+                        train_py_path.read_text(encoding="utf-8"),
+                        language="python",
+                    )
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Could not read train.py: {exc}")
+
+    # --- Final status block ---
+    if status_info:
+        st.divider()
+        status_label = status_info.get("status", "unknown")
+        reason = (status_info.get("reason") or "").strip()
+        color = {
+            "success": "#10B981",
+            "smoke_failed": "#EF4444",
+            "training_failed": "#EF4444",
+        }.get(status_label, "#9CA3AF")
+        st.markdown(
+            f"<div style='display:inline-block; padding:2px 10px; "
+            f"border-radius:6px; background:{color}; color:white; "
+            f"font-weight:700;'>{status_label}</div>",
+            unsafe_allow_html=True,
+        )
+        if reason:
+            with st.expander("status.json reason", expanded=False):
+                st.code(reason, language="text")
 
     return True
 

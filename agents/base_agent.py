@@ -50,9 +50,21 @@ class BaseAgent(ABC):
 
     name: ClassVar[AgentName]
 
+    # Event types that get broadcast to Slack when `self.slack` is wired.
+    # Keep this tight to avoid flooding the channel — TOOL_CALL and THINKING
+    # would push 30+ messages per pipeline run.
+    _SLACK_BROADCAST_TYPES: ClassVar[set] = {
+        EventType.STARTED,
+        EventType.COMPLETED,
+        EventType.ERROR,
+    }
+
     def __init__(self, store: MemoryStore, run_id: str) -> None:
         self.store = store
         self.run_id = run_id
+        # Slack handle is set by the Coordinator after construction if the
+        # HITL service has Slack wired. Default None = no Slack broadcast.
+        self.slack: Any = None
 
     # ------------------------------------------------------------------
     # Live trace
@@ -63,7 +75,7 @@ class BaseAgent(ABC):
         message: str = "",
         payload: dict[str, Any] | None = None,
     ) -> None:
-        """Emit an event to both SQLite (dashboard) and loguru (terminal)."""
+        """Emit an event to SQLite (dashboard) + loguru (terminal) + Slack (if wired)."""
         event = AgentEvent(
             run_id=self.run_id,
             agent=self.name,
@@ -76,6 +88,27 @@ class BaseAgent(ABC):
         logger.opt(depth=1).log(
             level, "[{}] {}: {}", self.name.value, event_type.value, message
         )
+        # Broadcast lifecycle / failure events to Slack if wired. Routes to
+        # the agent's dedicated channel (per the channel_map) if configured;
+        # otherwise to the main coordinator channel. Wrapped in try/except so
+        # a flaky bot never kills a pipeline run.
+        if self.slack is not None and event_type in self._SLACK_BROADCAST_TYPES:
+            try:
+                emoji = {
+                    EventType.STARTED: ":arrow_forward:",
+                    EventType.COMPLETED: ":white_check_mark:",
+                    EventType.ERROR: ":x:",
+                }.get(event_type, ":mega:")
+                self.slack.notify(
+                    self.run_id,
+                    f"{emoji} *{self.name.value}* {event_type.value}: {message}",
+                    agent=self.name.value,
+                )
+            except Exception:  # noqa: BLE001
+                logger.opt(depth=1).warning(
+                    "Slack broadcast failed for {} {}",
+                    self.name.value, event_type.value,
+                )
 
     @contextmanager
     def _lifecycle(self, summary: str = "") -> Iterator[None]:

@@ -132,10 +132,10 @@ def test_unknown_request_raises_lookup_error(queue):
 
 
 # ---------------------------------------------------------------------------
-# HITLCoordinatorService end-to-end (no Telegram).
+# HITLCoordinatorService end-to-end (no Slack).
 # ---------------------------------------------------------------------------
 def test_coordinator_service_blocks_then_returns(queue, store):
-    service = HITLCoordinatorService(store=store, queue=queue, telegram=None)
+    service = HITLCoordinatorService(store=store, queue=queue, slack=None)
     req = ApprovalRequest(
         run_id="r1", agent=AgentName.STRATEGY, title="approve me",
     )
@@ -156,7 +156,7 @@ def test_coordinator_service_blocks_then_returns(queue, store):
 
 
 def test_coordinator_service_raises_on_timeout(queue, store):
-    service = HITLCoordinatorService(store=store, queue=queue, telegram=None)
+    service = HITLCoordinatorService(store=store, queue=queue, slack=None)
     req = ApprovalRequest(
         run_id="r1", agent=AgentName.STRATEGY, title="will time out",
     )
@@ -171,7 +171,7 @@ def test_coordinator_service_raises_on_timeout(queue, store):
 def test_full_pipeline_with_dashboard_simulator(store):
     """Pipeline runs, dashboard (separate MemoryStore) approves, pipeline completes."""
     queue = ApprovalQueue(store)
-    service = HITLCoordinatorService(store=store, queue=queue, telegram=None)
+    service = HITLCoordinatorService(store=store, queue=queue, slack=None)
     coord = Coordinator(store=store, hitl=service)
 
     # Simulate the dashboard: poll for pending approvals on its own store and

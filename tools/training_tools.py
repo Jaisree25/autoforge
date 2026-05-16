@@ -52,6 +52,37 @@ def load_image_folder(root: Path) -> tuple[np.ndarray, np.ndarray, list[str]]:
     return np.stack(images), np.array(labels, dtype=np.int64), classes
 
 
+_ID_TOKENS = ("_id", "customer_id", "user_id", "id_", "uuid")
+
+
+def _is_id_column(name: str) -> bool:
+    """Name-based ID detection. Catches `id`, `customer_id`, `PassengerId`."""
+    n = name.lower()
+    if n == "id":
+        return True
+    if any(t in n for t in _ID_TOKENS):
+        return True
+    if n.endswith("id") and len(n) > 3:
+        return True
+    return False
+
+
+def _is_high_card_drop(df, col: str) -> bool:
+    """High-cardinality columns AutoForge auto-drops."""
+    try:
+        n = len(df)
+        if n == 0:
+            return False
+        nunique = df[col].nunique(dropna=True)
+        if nunique / n > 0.9:
+            return True
+        if df[col].dtype == object and nunique > 50:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 def load_csv_split_or_full(
     prepared_dir: Path | None,
     fallback_csv: Path,
@@ -59,8 +90,10 @@ def load_csv_split_or_full(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Load (X_train, y_train, X_test, y_test) — test arrays may be None.
 
-    Looks for `<prepared_dir>/train.csv` + `<prepared_dir>/test.csv` first.
-    Falls back to `fallback_csv` if the prepared split isn't present.
+    Drops ID-like columns, auto-one-hots leftover non-numeric features, and
+    encodes string target labels to int — same logic as the Trainer's
+    `autoforge_helpers.load_csv_split`, so the Oracle baseline and the
+    LLM-generated trainer see identical numeric input.
     """
     import pandas as pd
 
@@ -74,7 +107,52 @@ def load_csv_split_or_full(
         df = pd.read_csv(fallback_csv)
         train_df, test_df = df, None
 
+    # Drop ID-like + high-cardinality / near-unique columns from features.
+    drop_cols = [
+        c for c in train_df.columns
+        if c != target_column
+        and (_is_id_column(c) or _is_high_card_drop(train_df, c))
+    ]
+    if drop_cols:
+        train_df = train_df.drop(columns=drop_cols, errors="ignore")
+        if test_df is not None:
+            test_df = test_df.drop(columns=drop_cols, errors="ignore")
+
+    # Auto-one-hot non-numeric feature columns (consistent across splits).
     feature_cols = [c for c in train_df.columns if c != target_column]
+
+    # Fill remaining missing values before to_numpy().
+    for c in feature_cols:
+        train_missing = train_df[c].isna().any()
+        test_missing = test_df is not None and test_df[c].isna().any()
+        if train_missing or test_missing:
+            if pd.api.types.is_numeric_dtype(train_df[c]):
+                med = train_df[c].median()
+                train_df[c] = train_df[c].fillna(med)
+                if test_df is not None:
+                    test_df[c] = test_df[c].fillna(med)
+            else:
+                mode = train_df[c].mode()
+                fill = mode.iloc[0] if len(mode) else "missing"
+                train_df[c] = train_df[c].fillna(fill)
+                if test_df is not None:
+                    test_df[c] = test_df[c].fillna(fill)
+    obj_cols = [c for c in feature_cols if train_df[c].dtype == object or (
+        test_df is not None and test_df[c].dtype == object
+    )]
+    if obj_cols:
+        if test_df is not None:
+            combined = pd.concat(
+                [train_df.assign(__split="train"), test_df.assign(__split="test")],
+                ignore_index=True,
+            )
+            combined = pd.get_dummies(combined, columns=obj_cols, drop_first=False)
+            train_df = combined[combined["__split"] == "train"].drop(columns="__split")
+            test_df = combined[combined["__split"] == "test"].drop(columns="__split")
+        else:
+            train_df = pd.get_dummies(train_df, columns=obj_cols, drop_first=False)
+        feature_cols = [c for c in train_df.columns if c != target_column]
+
     X_train = train_df[feature_cols].to_numpy(dtype=np.float32)
     y_train = train_df[target_column].to_numpy()
 
@@ -83,6 +161,17 @@ def load_csv_split_or_full(
         y_test = test_df[target_column].to_numpy()
     else:
         X_test, y_test = None, None
+
+    # Encode non-numeric target labels (consistent map across splits).
+    if y_train.dtype == object or (y_test is not None and y_test.dtype == object):
+        classes_set = set(y_train.tolist())
+        if y_test is not None:
+            classes_set |= set(y_test.tolist())
+        classes = sorted(classes_set)
+        cls_to_idx = {c: i for i, c in enumerate(classes)}
+        y_train = np.array([cls_to_idx[v] for v in y_train], dtype=np.int64)
+        if y_test is not None:
+            y_test = np.array([cls_to_idx[v] for v in y_test], dtype=np.int64)
 
     return X_train, y_train, X_test, y_test
 
@@ -312,6 +401,66 @@ def evaluate_classifier(
         "precision": prec,
         "recall": rec,
         "auc": auc,
+        "latency_p50_ms": float(np.percentile(latencies, 50)),
+        "latency_p95_ms": float(np.percentile(latencies, 95)),
+        "latency_p99_ms": float(np.percentile(latencies, 99)),
+        "latency_mean_ms": float(np.mean(latencies)),
+        "throughput_qps": throughput_qps,
+        "n_test_samples": int(len(X_test)),
+    }
+
+
+def evaluate_regressor(
+    model,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    metric: str = "r2",
+) -> dict[str, Any]:
+    """Same shape as evaluate_classifier but for regression metrics.
+
+    Returns RMSE / MAE / R². `headline_metric` honors the requested metric;
+    if it's not a regression metric, falls back to R².
+    """
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+    n_latency = min(100, len(X_test))
+    latencies = []
+    for i in range(n_latency):
+        t0 = time.perf_counter()
+        _ = model.predict(X_test[i : i + 1])
+        latencies.append((time.perf_counter() - t0) * 1000.0)
+
+    t0 = time.perf_counter()
+    y_pred = model.predict(X_test)
+    bulk_time = max(time.perf_counter() - t0, 1e-9)
+    throughput_qps = float(len(X_test) / bulk_time)
+
+    mse = float(mean_squared_error(y_test, y_pred))
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_test, y_pred))
+    r2 = float(r2_score(y_test, y_pred))
+
+    m = (metric or "r2").lower()
+    if m == "rmse":
+        headline = rmse
+    elif m in ("mae", "mean_absolute_error"):
+        headline = mae
+    elif m == "mse":
+        headline = mse
+    else:
+        m = "r2"
+        headline = r2
+
+    # `accuracy` field reused as the "headline_in_accuracy_position" so
+    # BenchmarkReport.accuracy_value gets the headline regardless of task.
+    return {
+        "headline_metric": m,
+        "headline_value": headline,
+        "accuracy": r2,    # R² is the closest to "accuracy" for regression
+        "f1": rmse,        # repurposed: surface RMSE in the f1 slot
+        "precision": mae,  # repurposed: surface MAE in the precision slot
+        "recall": mse,     # repurposed: surface MSE in the recall slot
+        "auc": None,
         "latency_p50_ms": float(np.percentile(latencies, 50)),
         "latency_p95_ms": float(np.percentile(latencies, 95)),
         "latency_p99_ms": float(np.percentile(latencies, 99)),

@@ -236,4 +236,4 @@ def _render_default(store: MemoryStore, req: ApprovalRequest) -> None:
                 comment="rejected via dashboard",
             ))
             st.rerun()
-        st.caption("You can also respond via Telegram (if configured).")
+        st.caption("You can also respond via Slack (reply `CONFIRM` or `REJECT` if configured).")

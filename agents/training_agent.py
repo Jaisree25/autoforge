@@ -1,30 +1,30 @@
-"""Training Agent — full agentic-pipeline pattern ported into AutoForge.
+"""Training Agent — linear one-pass flow.
 
-Pipeline (matches the user's `agentic-pipeline` C-compiler-inspired loop):
+Pipeline:
 
-  1. Oracle baseline (sklearn LogisticRegression on flattened input) — defines
-     the "must beat by 5 points" sanity gate.
-  2. Generate `design.md` via Nemotron — architecture + hyperparams +
-     estimated wall-clock + success criteria.
-  3. **HITL gate — design.md approval.** Trainer pauses. The dashboard's
-     approval panel shows the design; the human approves / edits / rejects.
-  4. Generate `code/model.py` + `code/train.py` via Nemotron (structured
-     JSON output, sklearn-based).
-  5. Smoke harness — py_compile, import, instantiate model. Emits
-     `verify_report.json`. Hard-fail if anything errors.
-  6. Subprocess training — run `code/train.py` with a wall-clock cap, capture
-     stdout/stderr to `logs/`. Soft-success if `best.pkl` exists even after
-     timeout.
-  7. Load + return `TrainingResult` from the saved model + metrics.
+  1. Oracle baseline (sklearn LogReg) — the "must beat by 5 points" gate.
+  2. **Generate design.md** (LLM call 1) — Nemotron 9B writes a short
+     markdown design doc using full upstream context.
+  3. **HITL gate on design.md** — human approves the design BEFORE any
+     code is generated. Editing the design changes what model.py commits to.
+  4. **Generate model.py** (LLM call 2) — Nemotron 9B writes the sklearn
+     estimator with hyperparameters matching the approved design.
+  5. AutoForge writes the templated train.py (reads prep_config.json at
+     runtime) and drops autoforge_helpers.py beside it.
+  6. **Smoke harness** — py_compile, import, train.py --help, design.md
+     structure check. One-shot — if smoke fails the Trainer aborts.
+  7. **Subprocess training** — run train.py. If it fails, the Trainer aborts.
+  8. **Build TrainingResult** — read best.pkl + metrics.json.
 
-The internal design.md gate is what makes this "agentic" rather than just
-"sklearn HPO with extra steps." Coordinator passes the HITL service in at
-construction time; Trainer calls `self.hitl.request_and_wait()` mid-run.
+No retry loop, no fallback templates, no attempt state machine. One pass,
+fail loudly on any error. Keeps the agent honest and the demo flow simple.
 """
 from __future__ import annotations
 
 import json
+import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -47,24 +47,37 @@ from contracts.schemas import (
 from agents._llm_client import NemotronClient
 from agents.base_agent import BaseAgent
 from tools import training_pipeline as tp
-from tools import training_tools as tt
+
+
+# Source for the helper module the Trainer drops into the training dir
+# as `autoforge_helpers.py`.
+_HELPERS_SRC = (
+    Path(__file__).resolve().parent.parent / "tools" / "train_helpers.py"
+)
 
 
 class TrainerError(Exception):
-    """Unrecoverable failure in the Trainer's pipeline."""
+    """Unrecoverable failure in the linear Trainer pipeline."""
 
 
 class TrainingAgent(BaseAgent):
-    """Agentic Trainer — design → HITL → code → smoke → train → report."""
+    """Linear Trainer — design → HITL → model → train.
+
+    No retries: a one-pass agentic flow that fails loudly. The Researcher
+    has already constrained the candidate to sklearn, the Preparer has
+    already produced the split + prep_config — by the time we run, the
+    LLM has a tight surface to misuse.
+    """
 
     name: ClassVar[AgentName] = AgentName.TRAINING
 
     def __init__(self, store, run_id: str, hitl=None) -> None:
         super().__init__(store=store, run_id=run_id)
-        # 49B for the planning + code-gen calls — sklearn code-gen wants
-        # solid instruction following.
+        # 49B model — slower (~30-60s per call) but reliably follows the
+        # sklearn-only / rigid-shape constraints. The 9B dropped LightGBM
+        # references and produced empty model.py outputs.
         self.llm = NemotronClient(model=COORDINATOR_MODEL)
-        self.hitl = hitl  # optional; if None the design gate is auto-approved
+        self.hitl = hitl  # optional; if None the design gate auto-approves
 
     # ------------------------------------------------------------------
     def run(  # type: ignore[override]
@@ -73,21 +86,46 @@ class TrainingAgent(BaseAgent):
         training_envelope: TrainingEnvelope,
         dataset_profile: DatasetProfile,
         preparation_report: PreparationReport | None = None,
+        previous_feedback: dict[str, Any] | None = None,
+        attempt_num: int = 1,
     ) -> TrainingResult:
         run_dir = ARTIFACTS_DIR / self.run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        code_dir = run_dir / "code"
-        models_dir = run_dir / "models"
-        logs_dir = run_dir / "logs"
+        training_root = run_dir / "training"
+        training_root.mkdir(parents=True, exist_ok=True)
+        # Each attempt lives in its own subdir so retries don't clobber prior
+        # artifacts. The latest attempt-N directory is the canonical "current
+        # result"; the Coordinator surfaces all attempts for the demo.
+        code_dir = training_root / f"attempt-{attempt_num}"
+        code_dir.mkdir(parents=True, exist_ok=True)
+        models_dir = code_dir / "models"
+        logs_dir = code_dir / "logs"
 
-        with self._lifecycle("design → code → smoke → train"):
-            # --- Stage 0: Precondition — Preparer must have produced a split ---
+        lifecycle_label = (
+            f"design → gate → model → train (attempt {attempt_num})"
+            if previous_feedback is None
+            else f"RETRY (attempt {attempt_num}) with Evaluator feedback"
+        )
+
+        with self._lifecycle(lifecycle_label):
+            if previous_feedback:
+                self.emit_event(
+                    EventType.INFO,
+                    message=(
+                        f"received Evaluator feedback: "
+                        f"failure_mode={previous_feedback.get('failure_mode')!r}, "
+                        f"gap={previous_feedback.get('accuracy_gap')}, "
+                        f"{len(previous_feedback.get('suggestions') or [])} suggestion(s)"
+                    ),
+                    payload={"feedback": previous_feedback},
+                )
             self._check_prepared_data(dataset_profile, preparation_report)
+            self._announce_helper_actions(dataset_profile, preparation_report)
 
-            # --- Stage 1: Oracle baseline ---
+            # --- Stage 1: Oracle ---
             self.emit_event(
                 EventType.TOOL_CALL,
-                message="oracle = sklearn.LogisticRegression on flattened input",
+                message="oracle = sklearn.LogisticRegression on the split",
             )
             oracle = tp.run_oracle(dataset_profile, preparation_report, run_dir)
             self.emit_event(
@@ -99,36 +137,102 @@ class TrainingAgent(BaseAgent):
                 ),
             )
 
-            # --- Stage 2: Codegen + smoke retry loop ---
-            # Per the agentic-pipeline pattern: up to MAX_ATTEMPTS LLM calls,
-            # each retry receives the previous attempt's verify errors as
-            # context. After all retries fail, fall back to a hardcoded
-            # MLP-on-MNIST template so the demo doesn't break.
-            design_md, code_files, design_path, verify = (
-                self._codegen_with_retries(
-                    strategy_spec=strategy_spec,
-                    dataset_profile=dataset_profile,
-                    training_envelope=training_envelope,
-                    preparation_report=preparation_report,
-                    oracle=oracle,
-                    run_dir=run_dir,
-                    code_dir=code_dir,
-                    max_attempts=3,
+            prep_config = self._load_prep_config(preparation_report)
+            if prep_config:
+                self.emit_event(
+                    EventType.INFO,
+                    message=(
+                        f"loaded prep_config: {', '.join(prep_config.keys())}"
+                    ),
                 )
+
+            # --- Stage 2: design.md ---
+            self.emit_event(
+                EventType.TOOL_CALL,
+                message=f"nemotron.design_md ({self.llm.model})",
+            )
+            design_md = tp.generate_design_md(
+                llm=self.llm,
+                spec=strategy_spec,
+                profile=dataset_profile,
+                envelope=training_envelope,
+                oracle=oracle,
+                prep=preparation_report,
+                prep_config=prep_config,
+                previous_feedback=previous_feedback,
+            )
+            design_path = code_dir / "design.md"
+            design_path.write_text(design_md, encoding="utf-8")
+            self.emit_event(
+                EventType.INFO,
+                message=f"design.md written ({len(design_md)} chars)",
             )
 
-            # --- Stage 3: HITL gate on design.md (after code passes smoke) ---
-            design_md = self._gate_design(
+            # --- Stage 3: HITL gate on design.md ---
+            approved_design = self._gate_design(
                 design_md=design_md,
                 oracle=oracle,
                 design_path=design_path,
                 strategy_spec=strategy_spec,
             )
+            if approved_design != design_md:
+                design_path.write_text(approved_design, encoding="utf-8")
+                design_md = approved_design
 
-            passed_checks = sum(1 for c in verify["checks"] if c["passed"])
-            total_checks = len(verify["checks"])
+            # --- Stage 4: model.py ---
+            self.emit_event(
+                EventType.TOOL_CALL,
+                message=f"nemotron.model_py ({self.llm.model})",
+            )
+            model_py = tp.generate_model_py(
+                llm=self.llm,
+                design_md=design_md,
+                spec=strategy_spec,
+                profile=dataset_profile,
+            )
+            (code_dir / "model.py").write_text(model_py, encoding="utf-8")
+            self.emit_event(
+                EventType.INFO,
+                message=f"model.py written ({len(model_py)} chars)",
+            )
 
-            # --- Stage 6: Subprocess training ---
+            # --- Stage 5: templated train.py + helpers ---
+            train_py = self._render_train_template(dataset_profile)
+            (code_dir / "train.py").write_text(train_py, encoding="utf-8")
+            shutil.copy2(_HELPERS_SRC, code_dir / "autoforge_helpers.py")
+            self.emit_event(
+                EventType.INFO,
+                message="wrote templated train.py + autoforge_helpers.py",
+            )
+
+            # --- Stage 6: smoke harness (one-shot, fail loudly) ---
+            self.emit_event(EventType.TOOL_CALL, message="smoke_harness")
+            verify = tp.run_smoke_harness(code_dir)
+            (code_dir / "verify_report.json").write_text(
+                json.dumps(verify, indent=2), encoding="utf-8",
+            )
+            n_pass = sum(1 for c in verify["checks"] if c["passed"])
+            n_total = len(verify["checks"])
+            if not verify["overall_passed"]:
+                failed = [
+                    c["detail"] for c in verify["checks"]
+                    if not c["passed"] and c.get("detail")
+                ]
+                for err in failed[:3]:
+                    self.emit_event(
+                        EventType.WARNING, message=f"smoke FAILED — {err[:200]}",
+                    )
+                self._write_status(code_dir, "smoke_failed", "; ".join(failed)[:500])
+                raise TrainerError(
+                    f"Smoke harness failed ({n_pass}/{n_total}): "
+                    + "; ".join(failed)[:500]
+                )
+            self.emit_event(
+                EventType.INFO,
+                message=f"smoke PASSED: {n_pass}/{n_total} ✓",
+            )
+
+            # --- Stage 7: subprocess training (one-shot, fail loudly) ---
             prepared_dir = self._resolve_prepared_dir(
                 dataset_profile, preparation_report,
             )
@@ -136,8 +240,9 @@ class TrainingAgent(BaseAgent):
             self.emit_event(
                 EventType.TOOL_CALL,
                 message=(
-                    f"subprocess.run(python code/train.py "
-                    f"--data-dir {prepared_dir.name} --max-time-seconds {max_seconds})"
+                    f"subprocess.run(python train.py "
+                    f"--data-dir {prepared_dir.name} "
+                    f"--max-time-seconds {max_seconds})"
                 ),
             )
             t0 = time.time()
@@ -151,328 +256,148 @@ class TrainingAgent(BaseAgent):
             sub_duration = time.time() - t0
 
             if not sub["success"]:
-                # Surface the last lines of stderr so the human sees what broke
-                if sub["stderr_tail"]:
+                stderr_tail = (
+                    sub.get("stderr_tail") or sub.get("stdout_tail") or ""
+                )
+                if stderr_tail:
                     self.emit_event(
                         EventType.WARNING,
-                        message=f"train.py stderr (last lines):\n{sub['stderr_tail'][:500]}",
+                        message=f"train.py stderr (last lines):\n{stderr_tail[:500]}",
                     )
+                self._write_status(
+                    code_dir, "training_failed",
+                    stderr_tail[:1000] or "(no stderr)",
+                )
                 raise TrainerError(
-                    f"Subprocess training failed: return_code={sub['return_code']}, "
-                    f"timed_out={sub['timed_out']}"
+                    f"Training subprocess failed "
+                    f"(return_code={sub['return_code']}, "
+                    f"timed_out={sub['timed_out']}). "
+                    f"Last stderr:\n{stderr_tail[:1000] or '(none)'}"
                 )
 
             metrics = sub.get("metrics") or {}
             val_acc = float(metrics.get("val_accuracy", 0.0))
-            train_seconds = float(metrics.get("train_seconds", sub_duration))
-            training_process = metrics.get("training_process") or {}
             self.emit_event(
                 EventType.INFO,
                 message=(
-                    f"training done in {sub_duration:.1f}s · "
-                    f"val_accuracy={val_acc:.3f}"
+                    f"training PASSED: val_accuracy={val_acc:.3f} in "
+                    f"{sub_duration:.1f}s"
                     + (" (TIMED OUT; soft success)" if sub["timed_out"] else "")
                 ),
                 payload={"metrics": metrics},
             )
+            self._write_status(
+                code_dir, "success",
+                f"val_accuracy={val_acc:.3f}, "
+                f"train_seconds={metrics.get('train_seconds', sub_duration):.1f}",
+            )
 
-            # --- Stage 7: Build TrainingResult ---
-            model_id = f"m_{int(time.time())}"
-            # Move the trained model into a stable name expected by Evaluator
-            best_pkl = Path(sub["best_pkl"]) if sub["best_pkl"] else None
-            if best_pkl is None or not best_pkl.exists():
-                raise TrainerError("No best.pkl produced by training subprocess.")
-
-            final_path = models_dir / f"{model_id}.pkl"
-            best_pkl.replace(final_path)
-
-            # Single-trial summary (no Optuna here — the agentic-pipeline
-            # pattern is one design → one training run; HPO is the
-            # Researcher's recommendation surface)
-            trials = [
-                TrialResult(
-                    trial_id=0,
-                    params={"design": "see design.md"},
-                    score=val_acc,
-                    duration_seconds=train_seconds,
-                    status="completed",
-                ),
-            ]
-
-            # best_params: surface the EFFECTIVE hyperparameters (what
-            # sklearn actually ran with), not just a design.md pointer. Falls
-            # back to the pointer if introspection failed.
-            effective = training_process.get("effective_params") or {}
-            best_params: dict[str, Any] = {
-                **effective,
-                "design_md_path": str(design_path),
-            }
-
-            return TrainingResult(
-                best_model_id=model_id,
-                metric_name=strategy_spec.success_metric or "accuracy",
-                best_score=val_acc,
-                best_params=best_params,
-                trials_completed=1,
-                total_trials=1,
-                training_time_seconds=train_seconds,
-                artifact_path=str(final_path),
-                library="sklearn",
-                all_trials=trials,
-                training_process=training_process,
-                notes=(
-                    f"agentic-pipeline: oracle={oracle['test_accuracy']:.3f}, "
-                    f"trained={val_acc:.3f} "
-                    f"(+{(val_acc - oracle['test_accuracy']):+.3f} vs oracle). "
-                    f"Smoke harness {passed_checks}/{total_checks} passed."
-                ),
+            # --- Stage 8: build TrainingResult ---
+            return self._build_result(
+                code_dir=code_dir,
+                sub=sub,
+                oracle=oracle,
+                spec=strategy_spec,
+                verify=verify,
             )
 
     # ------------------------------------------------------------------
-    # Codegen + smoke retry loop (the heart of the agentic-pipeline pattern)
+    # Helpers
     # ------------------------------------------------------------------
-    def _codegen_with_retries(
-        self,
-        strategy_spec: StrategySpec,
-        dataset_profile: DatasetProfile,
-        training_envelope: TrainingEnvelope,
-        preparation_report: PreparationReport | None,
-        oracle: dict[str, Any],
-        run_dir: Path,
-        code_dir: Path,
-        max_attempts: int = 3,
-    ) -> tuple[str, dict[str, str], Path, dict[str, Any]]:
-        """Try N LLM-codegen rounds, each verified by the smoke harness.
+    def _write_status(self, code_dir: Path, status: str, reason: str) -> None:
+        payload = {
+            "status": status,
+            "reason": reason,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        (code_dir / "status.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8",
+        )
 
-        Returns `(design_md, code_files, design_path, verify_report)`. Raises
-        TrainerError only if BOTH the LLM attempts AND the fallback template
-        fail their smoke check (which would be a real bug in our code).
-        """
-        design_path = run_dir / "design.md"
-        previous_errors: list[str] | None = None
-
-        for attempt in range(max_attempts):
-            self.emit_event(
-                EventType.TOOL_CALL,
-                message=(
-                    f"nemotron.generate_design_and_code "
-                    f"(attempt {attempt + 1}/{max_attempts}, /no_think)"
-                ),
-            )
-            try:
-                artifacts = tp.generate_design_and_code(
-                    llm=self.llm,
-                    spec=strategy_spec,
-                    profile=dataset_profile,
-                    envelope=training_envelope,
-                    oracle=oracle,
-                    prep=preparation_report,
-                    on_thinking=None,
-                    no_think=True,
-                    previous_errors=previous_errors,
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.emit_event(
-                    EventType.WARNING,
-                    message=f"codegen LLM call failed: {type(exc).__name__}: {exc}",
-                )
-                previous_errors = [f"LLM call raised: {exc}"]
-                continue
-
-            design_md = artifacts["design_md"]
-            # LLM only produced design.md + model.py. AutoForge's templated
-            # train.py is paired in. The template is parameterized by modality
-            # (and target column for CSV).
-            is_image = dataset_profile.modality.value == "image"
-            target_col = dataset_profile.target_column or "target"
-            train_py = (
-                _FALLBACK_TRAIN_IMAGE if is_image
-                else _FALLBACK_TRAIN_CSV.replace("__TARGET__", target_col)
-            )
-            code_files = {
-                "model.py": artifacts["model.py"],
-                "train.py": train_py,
-            }
-            design_path.write_text(design_md, encoding="utf-8")
-            code_dir.mkdir(parents=True, exist_ok=True)
-            for name, content in code_files.items():
-                (code_dir / name).write_text(content, encoding="utf-8")
-            self.emit_event(
-                EventType.INFO,
-                message=(
-                    f"attempt {attempt + 1}: design.md ({len(design_md)} chars) "
-                    f"+ model.py ({len(artifacts['model.py'])} chars) "
-                    f"+ templated train.py"
-                ),
-            )
-
-            # Run smoke harness
-            self.emit_event(
-                EventType.TOOL_CALL,
-                message=f"smoke_harness (attempt {attempt + 1})",
-            )
-            verify = tp.run_smoke_harness(code_dir)
-            (run_dir / "verify_report.json").write_text(
-                json.dumps(verify, indent=2), encoding="utf-8",
-            )
-            n_passed = sum(1 for c in verify["checks"] if c["passed"])
-            n_total = len(verify["checks"])
-            if verify["overall_passed"]:
-                self.emit_event(
-                    EventType.INFO,
-                    message=f"smoke passed: {n_passed}/{n_total} checks ✓",
-                )
-                return design_md, code_files, design_path, verify
-
-            # Collect specific errors for the next retry
-            failed_details = [
-                c["detail"] for c in verify["checks"]
-                if not c["passed"] and c.get("detail")
-            ]
-            previous_errors = failed_details
+    def _load_prep_config(
+        self, prep: PreparationReport | None,
+    ) -> dict[str, Any] | None:
+        if prep is None or not prep.prep_config_path:
+            return None
+        path = Path(prep.prep_config_path)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
             self.emit_event(
                 EventType.WARNING,
-                message=(
-                    f"smoke FAILED on attempt {attempt + 1}: "
-                    f"{n_passed}/{n_total} checks passed; "
-                    f"{len(failed_details)} error(s) — "
-                    + ("retrying" if attempt + 1 < max_attempts else "out of retries")
-                ),
+                message=f"could not parse prep_config.json: {exc}",
             )
-            for err in failed_details[:3]:
-                self.emit_event(
-                    EventType.WARNING,
-                    message=f"  • {err[:200]}",
-                )
+            return None
 
-        # All LLM attempts failed — fall back to a hardcoded template.
-        self.emit_event(
-            EventType.WARNING,
-            message=(
-                f"after {max_attempts} LLM attempts, falling back to "
-                "hardcoded MLP template (demo-safety net)"
+    # ------------------------------------------------------------------
+    # Build TrainingResult from the training dir
+    # ------------------------------------------------------------------
+    def _build_result(
+        self,
+        code_dir: Path,
+        sub: dict[str, Any],
+        oracle: dict[str, Any],
+        spec: StrategySpec,
+        verify: dict[str, Any],
+    ) -> TrainingResult:
+        metrics = sub.get("metrics") or {}
+        val_acc = float(metrics.get("val_accuracy", 0.0))
+        train_seconds = float(metrics.get(
+            "train_seconds", sub.get("duration_s", 0.0),
+        ))
+        training_process = metrics.get("training_process") or {}
+
+        best_pkl_path = code_dir / "models" / "best.pkl"
+        if not best_pkl_path.exists():
+            raise TrainerError(
+                f"Training reported success but best.pkl is missing at "
+                f"{best_pkl_path}"
+            )
+
+        passed_checks = sum(1 for c in verify["checks"] if c["passed"])
+        total_checks = len(verify["checks"])
+        model_id = f"m_{int(time.time())}"
+
+        effective = training_process.get("effective_params") or {}
+        best_params: dict[str, Any] = {
+            **effective,
+            "design_md_path": str(code_dir / "design.md"),
+        }
+
+        trials = [
+            TrialResult(
+                trial_id=0,
+                params={"design": "see design.md"},
+                score=val_acc,
+                duration_seconds=train_seconds,
+                status="completed",
+            ),
+        ]
+
+        return TrainingResult(
+            best_model_id=model_id,
+            metric_name=spec.success_metric or "accuracy",
+            best_score=val_acc,
+            best_params=best_params,
+            trials_completed=1,
+            total_trials=1,
+            training_time_seconds=train_seconds,
+            artifact_path=str(best_pkl_path),
+            library="sklearn",
+            all_trials=trials,
+            training_process=training_process,
+            notes=(
+                f"linear-pipeline: oracle={oracle['test_accuracy']:.3f}, "
+                f"trained={val_acc:.3f} "
+                f"(+{(val_acc - oracle['test_accuracy']):+.3f} vs oracle). "
+                f"Smoke {passed_checks}/{total_checks} passed."
             ),
         )
-        design_md, code_files = self._fallback_template(
-            dataset_profile, strategy_spec, oracle,
-        )
-        design_path.write_text(design_md, encoding="utf-8")
-        for name, content in code_files.items():
-            (code_dir / name).write_text(content, encoding="utf-8")
-        self.emit_event(
-            EventType.INFO,
-            message="wrote fallback template; running final smoke check",
-        )
-        verify = tp.run_smoke_harness(code_dir)
-        (run_dir / "verify_report.json").write_text(
-            json.dumps(verify, indent=2), encoding="utf-8",
-        )
-        if not verify["overall_passed"]:
-            for c in verify["checks"]:
-                if not c["passed"]:
-                    self.emit_event(
-                        EventType.ERROR,
-                        message=f"fallback failed check: {c['name']} — {c['detail']}",
-                    )
-            raise TrainerError(
-                "Even the fallback template failed smoke. This is a bug in "
-                "TrainingAgent._fallback_template."
-            )
-        return design_md, code_files, design_path, verify
 
     # ------------------------------------------------------------------
-    # Hardcoded fallback template — guarantees the demo doesn't break.
-    # ------------------------------------------------------------------
-    def _fallback_template(
-        self,
-        profile: DatasetProfile,
-        spec: StrategySpec,
-        oracle: dict[str, Any],
-    ) -> tuple[str, dict[str, str]]:
-        """Return (design_md, code_files) using a known-good sklearn MLP recipe."""
-        is_image = profile.modality.value == "image"
-
-        oracle_acc = float(oracle.get("test_accuracy", 0.0))
-        target_metric = spec.success_metric or "accuracy"
-        target_thresh = max(spec.success_threshold, oracle_acc + 0.05)
-        data_layout = (
-            "`<data-dir>/train/<class>/*.png` + `<data-dir>/test/<class>/*.png`"
-            if is_image else
-            "`<data-dir>/train.csv` + `<data-dir>/test.csv`"
-        )
-
-        design_md = (
-            "# Fallback design (LLM codegen failed after 3 attempts)\n\n"
-            "AutoForge's hard-coded safety-net template kicked in. The "
-            "structure below mirrors the LLM-generated format so the design "
-            "gate review is consistent.\n\n"
-            "## Architecture commitment\n"
-            "`sklearn.neural_network.MLPClassifier`. Chosen over LogisticRegression "
-            "as a fallback because the dataset is non-linear (image pixels / "
-            "tabular mixed features) and MLP outperforms linear baselines on "
-            "small datasets with mild regularization.\n\n"
-            "## Hyperparameters (final)\n"
-            "- `hidden_layer_sizes = (128, 64)` — Two layers: 128 captures feature "
-            "  patterns, 64 narrows to class separation. Total ~110k params, well "
-            "  under the envelope cap.\n"
-            "- `alpha = 1e-3` — Mild L2 regularization; the dataset is small so we "
-            "  prefer regularization over deeper architecture.\n"
-            "- `learning_rate_init = 1e-3` — Standard Adam starting LR; converges "
-            "  quickly for this size of network.\n"
-            "- `max_iter = 30` — Enough for convergence on the prepared set without "
-            "  blowing the wall-clock budget.\n"
-            "- `random_state = 42` — Reproducibility across runs.\n\n"
-            "## Wall-clock budget\n"
-            "Estimated ~10s on CPU for the prepared dataset. Envelope cap respected. "
-            "If we hit the cap, sklearn's `MLPClassifier` will stop at `max_iter` "
-            "naturally — no separate abort needed.\n\n"
-            "## Success criteria\n"
-            f"- Hard target: `{target_metric}` ≥ {target_thresh:.3f}.\n"
-            f"- Oracle delta: must beat sklearn LogReg baseline "
-            f"(test_accuracy={oracle_acc:.3f}) by ≥0.05.\n"
-            "- Rollback trigger: if `val_accuracy < oracle - 0.05`, the Evaluator "
-            "  flags FAIL and the run does not deploy.\n\n"
-            "## Risks & anti-patterns\n"
-            "- Risk: MLP on tiny datasets can overfit. Mitigated by `alpha=1e-3`.\n"
-            "- Anti-pattern avoided: we are NOT flattening labels or one-hot "
-            "  encoding the target — sklearn handles integer class labels directly.\n"
-            "- Overfitting risk given dataset size: moderate; augmentation "
-            "  (if recorded by the Preparer) helps further but we do not depend on it.\n\n"
-            "## Code structure\n"
-            "- `model.py` exports `build_model() -> MLPClassifier`.\n"
-            f"- `train.py` is AutoForge-templated: loads {data_layout}, calls "
-            "  `build_model()`, fits, evaluates, saves `best.pkl` and `metrics.json`.\n"
-            "- Required estimator surface: `.fit(X, y)` + `.predict(X)`. Met by MLPClassifier.\n\n"
-            "## Verification plan\n"
-            "- Smoke harness: `py_compile model.py`, `import build_model`, "
-            "  `build_model()` instantiates.\n"
-            "- After training: assert `val_accuracy >= oracle_accuracy + 0.05`.\n"
-            "- Manual: confirm `best.pkl` loads via `joblib.load`.\n"
-        )
-
-        model_py = (
-            "from sklearn.neural_network import MLPClassifier\n"
-            "\n"
-            "def build_model():\n"
-            "    return MLPClassifier(\n"
-            "        hidden_layer_sizes=(128, 64),\n"
-            "        alpha=1e-3,\n"
-            "        learning_rate_init=1e-3,\n"
-            "        max_iter=30,\n"
-            "        random_state=42,\n"
-            "    )\n"
-        )
-
-        if is_image:
-            train_py = _FALLBACK_TRAIN_IMAGE
-        else:
-            target_col = profile.target_column or "target"
-            train_py = _FALLBACK_TRAIN_CSV.replace("__TARGET__", target_col)
-
-        return design_md, {"model.py": model_py, "train.py": train_py}
-
-    # ------------------------------------------------------------------
-    # Design HITL gate
+    # HITL gate on design.md — fires once, before model.py is generated.
     # ------------------------------------------------------------------
     def _gate_design(
         self,
@@ -481,11 +406,12 @@ class TrainingAgent(BaseAgent):
         design_path: Path,
         strategy_spec: StrategySpec,
     ) -> str:
-        """Request human approval of design.md. Returns the (possibly edited) text."""
         if self.hitl is None:
             self.emit_event(
                 EventType.INFO,
-                message="no HITL service wired — auto-approving design.md (dev mode)",
+                message=(
+                    "no HITL service wired — auto-approving design.md (dev mode)"
+                ),
             )
             return design_md
 
@@ -495,14 +421,15 @@ class TrainingAgent(BaseAgent):
             agent=AgentName.TRAINING,
             title="Approve design.md (Trainer)",
             description=(
-                f"Trainer generated a design. Oracle baseline = "
-                f"{oracle['test_accuracy']:.3f}; must beat by ≥0.05. "
+                f"Trainer wrote a design before generating any code. Oracle "
+                f"baseline = {oracle['test_accuracy']:.3f}; must beat by ≥0.05. "
                 f"Target {strategy_spec.success_metric} ≥ "
-                f"{strategy_spec.success_threshold:.2f}."
+                f"{strategy_spec.success_threshold:.2f}. Approve to generate "
+                f"model.py and run training; edit to change hyperparameters."
             ),
             payload={
                 "summary": f"Trainer wrote design.md ({len(design_md)} chars)",
-                "next_agent": "code generation",
+                "next_agent": "model.py generation",
                 "design_md": design_md,
                 "design_path": str(design_path),
                 "oracle": oracle,
@@ -511,10 +438,12 @@ class TrainingAgent(BaseAgent):
         )
         self.emit_event(
             EventType.APPROVAL_REQUESTED,
-            message="design.md ready — awaiting human approval before code generation",
+            message="design.md ready — awaiting approval before model.py codegen",
             payload={
-                "summary": "Approve the proposed training design (architecture + HPs)",
-                "next_agent": "code generation",
+                "summary": (
+                    "Approve the proposed design (architecture + HPs)"
+                ),
+                "next_agent": "model.py generation",
                 "from_agent": AgentName.TRAINING.value,
                 "request_id": request.request_id,
             },
@@ -548,29 +477,18 @@ class TrainingAgent(BaseAgent):
                     EventType.INFO,
                     message="using edited design.md from reviewer",
                 )
-                design_path.write_text(edited, encoding="utf-8")
                 return edited
 
         return design_md
 
     # ------------------------------------------------------------------
-    # Precondition check — Trainer is the contract enforcer here
+    # Precondition check — tabular split must exist.
     # ------------------------------------------------------------------
     def _check_prepared_data(
         self,
         profile: DatasetProfile,
         prep: PreparationReport | None,
     ) -> None:
-        """Fail loudly if the Preparer didn't produce the expected layout.
-
-        Image modality: expects `prepared_dataset_path / {train, test}` dirs
-        with class subfolders. Tabular: expects `train.csv` + `test.csv`.
-
-        We do NOT auto-fix here. The Preparer has an internal split backstop
-        that should have caught this; if we got here without a split, something
-        is genuinely broken upstream and the demo should pause for a human to
-        investigate rather than silently train on the wrong data.
-        """
         if prep is None or not prep.prepared_dataset_path:
             raise TrainerError(
                 "Preparer did not return a prepared_dataset_path. "
@@ -582,56 +500,153 @@ class TrainingAgent(BaseAgent):
                 f"prepared_dataset_path does not exist: {prepared}"
             )
 
-        if profile.modality.value == "image":
-            train_dir = prepared / "train"
-            test_dir = prepared / "test"
-            if not train_dir.is_dir() or not test_dir.is_dir():
-                self.emit_event(
-                    EventType.ERROR,
-                    message=(
-                        f"Preparer output missing train/ or test/ subdir at "
-                        f"`{prepared}`. The Trainer requires a class-folder "
-                        f"split for image tasks. Aborting."
-                    ),
-                )
-                raise TrainerError(
-                    f"Preparer did not produce a train/test split for images "
-                    f"at {prepared}. Check the Preparer's plan and ensure a "
-                    f"`train_test_split_images` op ran."
-                )
+        train_csv = prepared / "train.csv"
+        test_csv = prepared / "test.csv"
+        if not train_csv.is_file() or not test_csv.is_file():
             self.emit_event(
-                EventType.INFO,
-                message=f"precondition OK: image split present at `{prepared}`",
+                EventType.ERROR,
+                message=(
+                    f"Preparer output missing train.csv or test.csv at "
+                    f"`{prepared}`. Aborting."
+                ),
             )
-            return
-
-        if profile.modality.value == "tabular":
-            train_csv = prepared / "train.csv"
-            test_csv = prepared / "test.csv"
-            if not train_csv.is_file() or not test_csv.is_file():
-                self.emit_event(
-                    EventType.ERROR,
-                    message=(
-                        f"Preparer output missing train.csv or test.csv at "
-                        f"`{prepared}`. Aborting."
-                    ),
-                )
-                raise TrainerError(
-                    f"Preparer did not produce train.csv/test.csv at {prepared}. "
-                    f"Check the Preparer's plan and ensure a "
-                    f"`train_test_split_csv` op ran."
-                )
-            self.emit_event(
-                EventType.INFO,
-                message=f"precondition OK: tabular split present at `{prepared}`",
+            raise TrainerError(
+                f"Preparer did not produce train.csv/test.csv at "
+                f"{prepared}. Ensure `train_test_split_csv` ran."
             )
-            return
-
-        # Unknown modality — let the rest of the pipeline try.
         self.emit_event(
-            EventType.WARNING,
-            message=f"precondition skipped: unknown modality `{profile.modality.value}`",
+            EventType.INFO,
+            message=f"precondition OK: tabular split present at `{prepared}`",
         )
+
+    # ------------------------------------------------------------------
+    # Transparency for AutoForge's auto-fixes — announce what the helpers
+    # will do BEFORE the Oracle / training subprocess runs, so the dashboard
+    # and Slack feed show the safety nets firing.
+    # ------------------------------------------------------------------
+    def _announce_helper_actions(
+        self,
+        profile: DatasetProfile,
+        prep: PreparationReport | None,
+    ) -> None:
+        if prep is None or not prep.prepared_dataset_path:
+            return
+        prepared = Path(prep.prepared_dataset_path)
+        train_csv = prepared / "train.csv"
+        if not train_csv.is_file():
+            return
+        try:
+            import pandas as pd
+            df = pd.read_csv(train_csv, nrows=200)
+        except Exception:  # noqa: BLE001
+            return
+        target_col = profile.target_column
+        id_tokens = ("_id", "customer_id", "user_id", "id_", "uuid")
+
+        def _is_id_col(name: str) -> bool:
+            n = name.lower()
+            if n == "id":
+                return True
+            if any(t in n for t in id_tokens):
+                return True
+            return n.endswith("id") and len(n) > 3
+
+        def _is_high_card(col_name: str) -> bool:
+            try:
+                n = len(df)
+                if n == 0:
+                    return False
+                nunique = df[col_name].nunique(dropna=True)
+                if nunique / n > 0.9:
+                    return True
+                if df[col_name].dtype == object and nunique > 50:
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+
+        # ID-like columns AutoForge will drop at load time.
+        id_cols = [
+            c for c in df.columns
+            if c != target_col and _is_id_col(c)
+        ]
+        # High-cardinality / near-unique columns AutoForge will also drop.
+        high_card_cols = [
+            c for c in df.columns
+            if c != target_col and c not in id_cols and _is_high_card(c)
+        ]
+        if id_cols:
+            self.emit_event(
+                EventType.WARNING,
+                message=(
+                    f"AutoForge safety net: will drop ID-like column(s) "
+                    f"{id_cols!r} (Preparer left them in; they would leak)"
+                ),
+                payload={"dropped_id_columns": id_cols},
+            )
+        if high_card_cols:
+            self.emit_event(
+                EventType.WARNING,
+                message=(
+                    f"AutoForge safety net: will drop high-cardinality / "
+                    f"near-unique column(s) {high_card_cols!r} (would "
+                    f"explode one-hot encoding or behave like an ID)"
+                ),
+                payload={"dropped_high_card_columns": high_card_cols},
+            )
+
+        # Non-numeric feature columns AutoForge will auto-one-hot at load time.
+        already_dropped = set(id_cols) | set(high_card_cols)
+        obj_cols = [
+            c for c in df.columns
+            if c != target_col and c not in already_dropped
+            and df[c].dtype == object
+        ]
+        if obj_cols:
+            self.emit_event(
+                EventType.WARNING,
+                message=(
+                    f"AutoForge safety net: will auto-one-hot non-numeric "
+                    f"column(s) {obj_cols!r} (Preparer's encode_categoricals "
+                    f"did not cover them)"
+                ),
+                payload={"auto_encoded_columns": obj_cols},
+            )
+
+        # Missing-value fills AutoForge will apply.
+        nan_cols = [
+            c for c in df.columns
+            if c != target_col and c not in already_dropped
+            and df[c].isna().any()
+        ]
+        if nan_cols:
+            self.emit_event(
+                EventType.WARNING,
+                message=(
+                    f"AutoForge safety net: will fill NaN in {nan_cols!r} "
+                    f"(numeric → column median, object → mode/'missing')"
+                ),
+                payload={"nan_filled_columns": nan_cols},
+            )
+
+        # Non-numeric target → auto-encode to int labels.
+        if target_col and target_col in df.columns and df[target_col].dtype == object:
+            self.emit_event(
+                EventType.WARNING,
+                message=(
+                    f"AutoForge safety net: will auto-encode non-numeric "
+                    f"target `{target_col}` to int class labels"
+                ),
+            )
+
+        if not (id_cols or high_card_cols or obj_cols or nan_cols):
+            self.emit_event(
+                EventType.INFO,
+                message=(
+                    "data inspection: prepared CSV is clean — "
+                    "no safety nets needed"
+                ),
+            )
 
     # ------------------------------------------------------------------
     def _resolve_prepared_dir(
@@ -639,221 +654,77 @@ class TrainingAgent(BaseAgent):
         profile: DatasetProfile,
         prep: PreparationReport | None,
     ) -> Path:
-        """Return the directory the generated train.py should read from."""
         if prep and prep.prepared_dataset_path:
             candidate = Path(prep.prepared_dataset_path)
             if candidate.exists():
                 return candidate
-        # Fallback: source dataset
         src = Path(profile.dataset_path)
         if src.is_file():
-            return src.parent  # train.py is expected to look for the file
+            return src.parent
         return src
 
+    # ------------------------------------------------------------------
+    # Templated train.py — AutoForge owns this so it's reliable.
+    # ------------------------------------------------------------------
+    def _render_train_template(self, profile: DatasetProfile) -> str:
+        target_col = profile.target_column or "target"
+        return _TRAIN_PY_TABULAR.replace("__TARGET__", target_col)
+
 
 # ===========================================================================
-# Fallback train.py templates — used only when 3 LLM attempts fail smoke.
-# Kept at module scope so they don't bloat the class body. Both are tested
-# manually to py_compile + import + run cleanly.
+# Templated train.py runner. AutoForge writes this directly into the
+# training directory next to the LLM's model.py. It reads prep_config.json
+# (the Preparer's output) at runtime and applies feature_scaling as recorded.
+# The autoforge_helpers module (also dropped next to it) handles joblib +
+# metrics boilerplate.
 # ===========================================================================
-_FALLBACK_TRAIN_IMAGE = '''\
-"""Fallback train.py — sklearn classifier on a class-folder image dataset.
+_TRAIN_PY_TABULAR = '''\
+"""AutoForge-templated train.py for tabular classification.
 
-After fit, introspects the fitted estimator and emits training-process info
-(iterations, loss curve, effective hyperparameters) so the Trainer's UI can
-show how training proceeded — separate from the Evaluator's accuracy/latency
-benchmark on the same artifact.
+Loads `<data-dir>/{train,test}.csv` via autoforge_helpers, applies
+prep_config feature_scaling if present, fits build_model() from model.py,
+saves best.pkl + metrics.json into --output-dir.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import time
 from pathlib import Path
 
-import joblib
-import numpy as np
-from PIL import Image
-from sklearn.metrics import accuracy_score
-
+from autoforge_helpers import load_csv_split, save_outputs
 from model import build_model
 
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp"}
-
-
-def load_split(split_dir):
-    classes = sorted(p.name for p in split_dir.iterdir() if p.is_dir())
-    cls_to_idx = {c: i for i, c in enumerate(classes)}
-    X, y = [], []
-    for cls in classes:
-        for img_path in (split_dir / cls).rglob("*"):
-            if img_path.suffix.lower() not in IMG_EXTS:
-                continue
-            with Image.open(img_path) as img:
-                arr = np.asarray(img.convert("L"), dtype=np.float32).flatten() / 255.0
-            X.append(arr)
-            y.append(cls_to_idx[cls])
-    return np.stack(X), np.array(y), classes
-
-
-def _safe_repr(v):
-    try:
-        json.dumps(v)
-        return v
-    except (TypeError, ValueError):
-        return repr(v)
-
-
-def _introspect_training(model):
-    """Pull training-process info off a fitted sklearn estimator."""
-    info = {"estimator_class": type(model).__name__}
-
-    # Iterations — MLPClassifier exposes int, LogisticRegression exposes array
-    n_iter = getattr(model, "n_iter_", None)
-    if n_iter is not None:
-        try:
-            iters = list(n_iter) if hasattr(n_iter, "__iter__") else [int(n_iter)]
-            info["n_iter"] = int(max(iters)) if iters else int(n_iter)
-        except Exception:
-            pass
-
-    # Loss curve — MLPClassifier exposes loss_curve_; GradientBoosting uses train_score_
-    if hasattr(model, "loss_curve_"):
-        try:
-            info["loss_curve"] = [float(x) for x in model.loss_curve_]
-        except Exception:
-            pass
-    elif hasattr(model, "train_score_"):
-        try:
-            info["loss_curve"] = [float(x) for x in model.train_score_]
-            info["loss_curve_label"] = "train_score (per iteration)"
-        except Exception:
-            pass
-
-    if hasattr(model, "best_loss_"):
-        try:
-            info["final_loss"] = float(model.best_loss_)
-        except Exception:
-            pass
-
-    # Effective hyperparameters — the actual values sklearn ran with
-    try:
-        info["effective_params"] = {
-            k: _safe_repr(v) for k, v in model.get_params(deep=False).items()
-        }
-    except Exception:
-        pass
-
-    return info
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--max-time-seconds", type=int, default=120)
-    args = parser.parse_args()
-
-    data_dir = Path(args.data_dir)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    X_train, y_train, _ = load_split(data_dir / "train")
-    X_test, y_test, _ = load_split(data_dir / "test")
-
-    t0 = time.time()
-    model = build_model()
-    model.fit(X_train, y_train)
-    train_seconds = time.time() - t0
-
-    val_accuracy = float(accuracy_score(y_test, model.predict(X_test)))
-    training_process = _introspect_training(model)
-    training_process["n_train"] = int(X_train.shape[0])
-    training_process["n_test"] = int(X_test.shape[0])
-
-    joblib.dump(model, output_dir / "best.pkl")
-    metrics = {
-        "val_accuracy": val_accuracy,
-        "train_seconds": train_seconds,
-        "training_process": training_process,
-    }
-    (output_dir / "metrics.json").write_text(json.dumps(metrics))
-    print(json.dumps({k: v for k, v in metrics.items() if k != "training_process"}))
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-
-_FALLBACK_TRAIN_CSV = '''\
-"""Fallback train.py — sklearn classifier on a tabular train.csv/test.csv split.
-
-After fit, introspects the fitted estimator and emits training-process info
-(iterations, loss curve, effective hyperparameters) so the Trainer's UI can
-show how training proceeded — separate from the Evaluator's accuracy/latency
-benchmark on the same artifact.
-"""
-import argparse
-import json
-import time
-from pathlib import Path
-
-import joblib
-import pandas as pd
-from sklearn.metrics import accuracy_score
-
-from model import build_model
 
 TARGET_COL = "__TARGET__"
 
-
-def _safe_repr(v):
-    try:
-        json.dumps(v)
-        return v
-    except (TypeError, ValueError):
-        return repr(v)
+_SCALER_BY_METHOD = {
+    "standard": "StandardScaler",
+    "minmax": "MinMaxScaler",
+    "robust": "RobustScaler",
+}
 
 
-def _introspect_training(model):
-    info = {"estimator_class": type(model).__name__}
-
-    n_iter = getattr(model, "n_iter_", None)
-    if n_iter is not None:
-        try:
-            iters = list(n_iter) if hasattr(n_iter, "__iter__") else [int(n_iter)]
-            info["n_iter"] = int(max(iters)) if iters else int(n_iter)
-        except Exception:
-            pass
-
-    if hasattr(model, "loss_curve_"):
-        try:
-            info["loss_curve"] = [float(x) for x in model.loss_curve_]
-        except Exception:
-            pass
-    elif hasattr(model, "train_score_"):
-        try:
-            info["loss_curve"] = [float(x) for x in model.train_score_]
-            info["loss_curve_label"] = "train_score (per iteration)"
-        except Exception:
-            pass
-
-    if hasattr(model, "best_loss_"):
-        try:
-            info["final_loss"] = float(model.best_loss_)
-        except Exception:
-            pass
-
-    try:
-        info["effective_params"] = {
-            k: _safe_repr(v) for k, v in model.get_params(deep=False).items()
-        }
-    except Exception:
-        pass
-
-    return info
+def _load_prep_config(data_dir: Path) -> dict:
+    for cand in [
+        data_dir.parent / "prep_config.json",
+        data_dir / "prep_config.json",
+    ]:
+        if cand.exists():
+            try:
+                return json.loads(cand.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                pass
+    return {}
 
 
-def main():
+def _build_scaler(method: str):
+    import sklearn.preprocessing as pp
+    cls = getattr(pp, _SCALER_BY_METHOD.get(method, "StandardScaler"), None)
+    return cls() if cls is not None else None
+
+
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -864,33 +735,30 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_df = pd.read_csv(data_dir / "train.csv")
-    test_df = pd.read_csv(data_dir / "test.csv")
+    X_train, y_train, X_test, y_test = load_csv_split(data_dir, TARGET_COL)
 
-    feature_cols = [c for c in train_df.columns if c != TARGET_COL]
-    X_train = train_df[feature_cols].to_numpy(dtype="float32")
-    y_train = train_df[TARGET_COL].to_numpy()
-    X_test = test_df[feature_cols].to_numpy(dtype="float32")
-    y_test = test_df[TARGET_COL].to_numpy()
+    prep_config = _load_prep_config(data_dir)
+    scaling = prep_config.get("feature_scaling") or {}
+    method = scaling.get("method")
+    if method:
+        scaler = _build_scaler(method)
+        if scaler is not None:
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
 
     t0 = time.time()
     model = build_model()
     model.fit(X_train, y_train)
     train_seconds = time.time() - t0
 
-    val_accuracy = float(accuracy_score(y_test, model.predict(X_test)))
-    training_process = _introspect_training(model)
-    training_process["n_train"] = int(X_train.shape[0])
-    training_process["n_test"] = int(X_test.shape[0])
-
-    joblib.dump(model, output_dir / "best.pkl")
-    metrics = {
-        "val_accuracy": val_accuracy,
-        "train_seconds": train_seconds,
-        "training_process": training_process,
-    }
-    (output_dir / "metrics.json").write_text(json.dumps(metrics))
-    print(json.dumps({k: v for k, v in metrics.items() if k != "training_process"}))
+    # `.score()` returns accuracy for classifiers, R² for regressors — so
+    # this works for both task types without branching on metric name.
+    val_accuracy = float(model.score(X_test, y_test))
+    headline = save_outputs(
+        model, output_dir, val_accuracy, train_seconds,
+        n_train=len(X_train), n_test=len(X_test),
+    )
+    print(json.dumps(headline))
 
 
 if __name__ == "__main__":
