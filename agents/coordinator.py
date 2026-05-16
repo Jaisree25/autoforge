@@ -155,13 +155,16 @@ class Coordinator(BaseAgent):
         run_id = run_id or str(uuid.uuid4())
         super().__init__(store=store, run_id=run_id)
         self.hitl = hitl
-        # If the HITL service has a Slack handle, broadcast lifecycle events
-        # from the Coordinator AND from every agent it constructs.
-        self.slack = getattr(hitl, "slack", None)
+        # Route every BaseAgent.emit_event() broadcast through the HITL service.
+        # The service decides where it goes:
+        #   - outbox mode (default): writes to slack_outbox; sandbox bot drains
+        #   - in-process mode: forwards to a host-side SlackApprovalBot
+        # Either way, agents call `self.slack.notify(...)` uniformly.
+        self.slack = hitl
 
     def _attach_slack(self, agent: BaseAgent) -> BaseAgent:
-        """Wire Slack into a freshly-constructed agent so its STARTED /
-        COMPLETED / ERROR events broadcast to the channel."""
+        """Wire the HITL service into a freshly-constructed agent so its
+        STARTED / COMPLETED / ERROR events broadcast to Slack."""
         agent.slack = self.slack
         return agent
 

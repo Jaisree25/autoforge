@@ -4,16 +4,22 @@
 persistence (runs, agent outputs, approvals, live events) goes through this
 class. Agent code MUST NOT touch SQLite or files under `data/` directly.
 
-Threading model
----------------
-The dashboard process and the pipeline process both talk to the same SQLite
-file. We enable WAL mode so concurrent readers don't block the writer, and
-open a fresh connection per call (cheap on SQLite) to sidestep any
-thread-affinity concerns.
+Threading + journal mode
+------------------------
+The dashboard process, the pipeline process, AND the sandboxed Slack bot
+(across a sshfs FUSE mount) all talk to the same SQLite file. WAL mode is
+faster for concurrent readers but relies on a host-local `-shm` shared
+memory file — SQLite explicitly does NOT support WAL over a network
+filesystem (sshfs/NFS), and opens fail with "unable to open database file".
+
+Override per environment via ``AUTOFORGE_SQLITE_JOURNAL`` (default DELETE).
+For pure host-only single-machine setups, set it to ``WAL`` for the
+concurrent-read speedup.
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -121,7 +127,10 @@ class MemoryStore:
             check_same_thread=False,
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL;")
+        # journal_mode is sticky in the DB header; we set it once in
+        # init_schema. Setting it per-connection causes lock contention
+        # across threads/processes, especially when the DB lives on a
+        # network filesystem (the sandbox FUSE mount).
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA foreign_keys = ON;")
         try:
@@ -151,6 +160,22 @@ class MemoryStore:
         # don't wrap it in our `_write_tx` context manager (DDL is idempotent
         # via `IF NOT EXISTS` — no atomicity needed across statements).
         with self._write_lock, self._conn() as conn:
+            # Set journal mode once at init, best-effort. The choice is
+            # sticky in the DB header so subsequent connections inherit it.
+            # If another process holds a lock when we run init_schema
+            # (e.g. the dashboard mid-poll), the PRAGMA will fail with
+            # "database is locked" — and that's fine: whatever mode was
+            # last successfully set still applies.
+            journal_mode = os.getenv("AUTOFORGE_SQLITE_JOURNAL", "DELETE").upper()
+            try:
+                current = conn.execute("PRAGMA journal_mode").fetchone()[0].upper()
+                if current != journal_mode:
+                    conn.execute(f"PRAGMA journal_mode = {journal_mode};")
+            except sqlite3.OperationalError as exc:
+                logger.warning(
+                    "Couldn't set journal_mode={} (continuing): {}",
+                    journal_mode, exc,
+                )
             conn.executescript(sql)
         _dump_json_schemas(ARTIFACTS_DIR / "contracts")
         logger.info("MemoryStore initialized at {}", self.db_path)
@@ -422,6 +447,95 @@ class MemoryStore:
                     (ApprovalStatus.PENDING.value, run_id),
                 ).fetchall()
         return [_row_to_approval(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Slack bot bridge (cross-process)
+    #
+    # The Slack bot runs in a NemoClaw sandbox in a separate process.
+    # Two tables let the host pipeline and the sandboxed bot communicate
+    # through this shared SQLite file without an extra RPC layer:
+    #
+    #   slack_posted  — bot stamps every approval it has already pushed
+    #                   to a channel. Host doesn't care; this is purely
+    #                   bot-internal idempotency.
+    #   slack_outbox  — host enqueues per-agent notifications (STARTED /
+    #                   COMPLETED / ERROR etc.); bot drains and posts.
+    # ------------------------------------------------------------------
+    def list_unposted_pending_approvals(self) -> list[ApprovalRequest]:
+        """Pending approvals the Slack bot has NOT yet sent to a channel.
+
+        Bot calls this in its poll loop; for each row, posts to Slack and
+        then calls `mark_approval_posted(request_id)`.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT a.* FROM approval_requests a
+                 LEFT JOIN slack_posted p ON p.request_id = a.request_id
+                 WHERE a.status = ? AND p.request_id IS NULL
+                 ORDER BY a.created_at ASC
+                """,
+                (ApprovalStatus.PENDING.value,),
+            ).fetchall()
+        return [_row_to_approval(r) for r in rows]
+
+    def mark_approval_posted(self, request_id: str) -> None:
+        """Record that the bot has pushed this approval to Slack.
+
+        `INSERT OR IGNORE` makes the call idempotent on bot restarts.
+        """
+        with self._write_tx() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO slack_posted (request_id, posted_at)
+                VALUES (?, ?)
+                """,
+                (request_id, _utcnow_iso()),
+            )
+
+    def enqueue_slack_notification(
+        self,
+        run_id: str,
+        message: str,
+        agent: AgentName | None = None,
+    ) -> int:
+        """Host-side notify() replacement — persist for the bot to drain."""
+        with self._write_tx() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO slack_outbox (run_id, agent, message, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    agent.value if agent is not None else None,
+                    message,
+                    _utcnow_iso(),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def list_unsent_notifications(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Outbox rows the bot hasn't yet posted, oldest first."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, run_id, agent, message, created_at
+                  FROM slack_outbox
+                 WHERE sent_at IS NULL
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_notification_sent(self, outbox_id: int) -> None:
+        with self._write_tx() as conn:
+            conn.execute(
+                "UPDATE slack_outbox SET sent_at = ? WHERE id = ?",
+                (_utcnow_iso(), outbox_id),
+            )
 
     # ------------------------------------------------------------------
     # Events

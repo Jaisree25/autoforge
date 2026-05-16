@@ -99,12 +99,4 @@ def render_run_picker(store: MemoryStore) -> PipelineRun | None:
             st.session_state[confirm_key] = True
             st.rerun()
 
-    st.sidebar.divider()
-    st.sidebar.caption("To start a new run:")
-    st.sidebar.code(
-        'python scripts/run_pipeline.py \\\n'
-        '  -d data/fixtures/churn_sample.csv \\\n'
-        '  -o "predict churn"',
-        language="bash",
-    )
     return run

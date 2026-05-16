@@ -1,0 +1,5 @@
+Objectives that work on the built-in fixtures (re-upload from data/fixtures/):
+
+iris.csv → classify iris species with accuracy >= 0.90
+titanic.csv → predict passenger survival with F1 >= 0.70
+housing.csv → predict median house value with R² >= 0.50

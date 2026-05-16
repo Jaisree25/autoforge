@@ -678,12 +678,6 @@ class TrainingAgent(BaseAgent):
 # metrics boilerplate.
 # ===========================================================================
 _TRAIN_PY_TABULAR = '''\
-"""AutoForge-templated train.py for tabular tasks.
-
-Loads `<data-dir>/{train,test}.csv` via autoforge_helpers, applies
-prep_config feature_scaling if present, runs an Optuna HP search around
-build_model() from model.py, saves the best model + metrics.json.
-"""
 from __future__ import annotations
 
 import argparse

@@ -1,0 +1,70 @@
+# AutoForge Slack bot policy — applied to the NemoClaw `autoforge` sandbox
+# when running `hitl/slack_bot_runner.py` inside the sandbox.
+#
+# Intent:
+#   - The bot needs ONE thing: talk to Slack's Web API + Socket Mode.
+#   - It does NOT need PyPI, GitHub, NVIDIA, Hugging Face, brew, npm, etc.
+#     Those are present in the default sandbox preset stack and are noise
+#     for this workload. Strip them before applying this preset:
+#       nemoclaw autoforge policy-remove npm
+#       nemoclaw autoforge policy-remove pypi
+#       nemoclaw autoforge policy-remove huggingface
+#       nemoclaw autoforge policy-remove brew
+#       nemoclaw autoforge policy-remove brave
+#
+# Apply via:
+#   nemoclaw autoforge policy-add --from-file policies/autoforge-slack-bot.yaml
+#
+# Verify with:
+#   openshell policy get        # confirm only slack remains
+#   curl https://pypi.org       # from inside sandbox — expected: blocked
+#   curl https://slack.com/api  # from inside sandbox — expected: 200
+#
+# The Slack bot token does NOT live in the bot's process env. The
+# OpenShell gateway store holds the real value (registered at onboard
+# time); the bot reads the placeholder `openshell:resolve:env:SLACK_BOT_TOKEN`
+# and the L7 proxy substitutes the secret at egress. Same for SLACK_APP_TOKEN.
+# See: docs/security/credential-storage.md in NemoClaw.
+
+preset:
+  name: autoforge-slack-bot
+  description: "AutoForge HITL Slack bot — Slack API + Socket Mode only, deny everything else."
+
+network_policies:
+  slack:
+    name: slack
+    endpoints:
+      - host: slack.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/api/**" }
+          - allow: { method: POST, path: "/api/**" }
+      - host: api.slack.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: hooks.slack.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: POST, path: "/**" }
+      # Socket Mode WSS — pure L4 CONNECT tunnel. `tls: skip` restores
+      # pass-through behaviour (OpenShell auto-terminates TLS otherwise,
+      # which breaks WSS).
+      - host: wss-primary.slack.com
+        port: 443
+        access: full
+        tls: skip
+      - host: wss-backup.slack.com
+        port: 443
+        access: full
+        tls: skip
+    binaries:
+      - { path: /usr/bin/python3 }
+      - { path: /usr/local/bin/python3 }

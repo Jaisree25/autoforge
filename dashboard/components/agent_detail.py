@@ -431,8 +431,82 @@ def _trainer_view(result: TrainingResult | None, run_id: str) -> None:
     if result.notes:
         st.caption(result.notes)
 
+    # --- Generated code + design.md (the LLM artifacts the user asked for) ---
+    # Same artifacts the in-progress view shows; surface them post-completion
+    # so reviewers / judges can still inspect what Nemotron produced.
+    _render_attempt_code_artifacts(run_dir)
+
     with st.expander("Raw output (JSON)"):
         st.json(result.model_dump(mode="json"), expanded=False)
+
+
+def _latest_attempt_dir(run_dir: Path) -> Path | None:
+    """Return the most-recent attempt-N subdir under run_dir/training, or None."""
+    training_dir = run_dir / "training"
+    if not training_dir.is_dir():
+        return None
+    attempts = [
+        p for p in training_dir.iterdir()
+        if p.is_dir() and p.name.startswith("attempt-")
+        and p.name.split("-", 1)[1].isdigit()
+    ]
+    if not attempts:
+        return None
+    return max(attempts, key=lambda p: int(p.name.split("-", 1)[1]))
+
+
+def _render_attempt_code_artifacts(run_dir: Path) -> None:
+    """Render design.md + model.py + train.py expanders for the latest attempt.
+
+    Used by both the in-progress trainer view and the final view so the LLM
+    output stays inspectable across the entire run lifecycle.
+    """
+    attempt = _latest_attempt_dir(run_dir)
+    if attempt is None:
+        return
+
+    design_path = attempt / "design.md"
+    model_py_path = attempt / "model.py"
+    train_py_path = attempt / "train.py"
+
+    if not any(p.exists() for p in (design_path, model_py_path, train_py_path)):
+        return
+
+    st.divider()
+    st.markdown(f"### LLM-generated artifacts &nbsp;·&nbsp; `{attempt.name}/`")
+
+    if design_path.exists():
+        with st.expander(
+            f"📄 design.md ({design_path.stat().st_size:,} bytes)"
+        ):
+            try:
+                st.markdown(design_path.read_text(encoding="utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not read design.md: {exc}")
+
+    if model_py_path.exists():
+        with st.expander(
+            f"🐍 model.py ({model_py_path.stat().st_size:,} bytes)"
+        ):
+            try:
+                st.code(
+                    model_py_path.read_text(encoding="utf-8"),
+                    language="python",
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not read model.py: {exc}")
+
+    if train_py_path.exists():
+        with st.expander(
+            f"🐍 train.py ({train_py_path.stat().st_size:,} bytes)"
+        ):
+            try:
+                st.code(
+                    train_py_path.read_text(encoding="utf-8"),
+                    language="python",
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not read train.py: {exc}")
 
 
 # ---------------------------------------------------------------------------

@@ -29,34 +29,19 @@ from config import PROJECT_ROOT, UPLOADS_DIR
 def render_run_launcher() -> None:
     """Render the 'Start a new run' panel in the sidebar."""
     with st.sidebar.expander("▶ Start a new run", expanded=False):
-        st.caption(
-            "Use one of the built-in fixtures or upload your own CSV. "
-            "The image fixture (`data/fixtures/mnist/`) is the recommended demo path."
-        )
-        preset = st.radio(
-            "Dataset",
-            options=["MNIST (images)", "Churn (CSV)", "Upload your own CSV"],
-            index=0,
-            key="launcher_preset",
-            horizontal=False,
-        )
-        uploaded = None
-        if preset == "Upload your own CSV":
-            uploaded = st.file_uploader(
-                "Pick a CSV file",
-                type=["csv"],
-                key="launcher_dataset",
-                accept_multiple_files=False,
-            )
+        st.caption("Upload a CSV. AutoForge is sklearn-only (no image modality).")
 
-        default_obj = (
-            "classify handwritten digits (MNIST) with accuracy >= 0.95"
-            if preset == "MNIST (images)"
-            else "predict customer churn with F1 >= 0.85"
+        uploaded = st.file_uploader(
+            "Pick a CSV file",
+            type=["csv"],
+            key="launcher_dataset",
+            accept_multiple_files=False,
         )
+
         objective = st.text_input(
             "Objective",
-            value=default_obj,
+            value="",
+            placeholder="e.g. classify iris species with accuracy >= 0.90",
             key="launcher_objective",
             help="Plain-English goal. The Researcher will parse the metric + threshold.",
         )
@@ -77,32 +62,12 @@ def render_run_launcher() -> None:
             if not objective.strip():
                 st.error("Type an objective.")
                 return
-
-            # Resolve dataset path based on preset
-            if preset == "MNIST (images)":
-                target = PROJECT_ROOT / "data" / "fixtures" / "mnist"
-                if not target.exists():
-                    st.error(
-                        f"MNIST fixture missing at {target}. "
-                        "Run `python scripts/create_mnist_fixture.py` first."
-                    )
-                    return
-            elif preset == "Churn (CSV)":
-                target = PROJECT_ROOT / "data" / "fixtures" / "churn_sample.csv"
-                if not target.exists():
-                    st.error(
-                        f"Churn fixture missing at {target}. "
-                        "Run `python scripts/create_fixtures.py` first."
-                    )
-                    return
-            else:
-                # Upload path
-                if uploaded is None:
-                    st.error("Pick a CSV file first.")
-                    return
-                safe_name = f"{uuid.uuid4().hex[:8]}_{uploaded.name}"
-                target = UPLOADS_DIR / safe_name
-                target.write_bytes(uploaded.getvalue())
+            if uploaded is None:
+                st.error("Pick a CSV file first.")
+                return
+            safe_name = f"{uuid.uuid4().hex[:8]}_{uploaded.name}"
+            target = UPLOADS_DIR / safe_name
+            target.write_bytes(uploaded.getvalue())
 
             cmd = [
                 sys.executable,
